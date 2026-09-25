@@ -7,6 +7,7 @@
 static DWORD pid = 0;
 static bool hidden = false;
 static std::string driverName = "TitanHide";
+static HANDLE debuggeeProcess = nullptr;
 
 static ULONG GetTitanHideOptions();
 #ifdef _WIN64
@@ -154,6 +155,10 @@ static bool InstallUserApiHooks()
     ok &= SetTitanBreakpoint("NtQuerySystemInformation", "TitanHide.NtQuerySystemInformation");
     ok &= SetTitanBreakpoint("NtSystemDebugControl", "TitanHide.NtSystemDebugControl");
     ok &= SetTitanBreakpoint("NtCreateThreadEx", "TitanHide.NtCreateThreadEx");
+    ok &= SetTitanBreakpoint("NtClose", "TitanHide.NtClose");
+    ok &= SetTitanBreakpoint("NtDuplicateObject", "TitanHide.NtDuplicateObject");
+    ok &= SetTitanBreakpoint("NtGetContextThread", "TitanHide.NtGetContextThread");
+    ok &= SetTitanBreakpoint("NtSetContextThread", "TitanHide.NtSetContextThread");
 
     userHooksInstalled = ok;
     _plugin_logprintf("[" PLUGIN_NAME "] User-mode Nt* interception %s\n", ok ? "enabled" : "partially failed");
@@ -170,6 +175,10 @@ static void RemoveUserApiHooks()
     DeleteTitanBreakpoint("TitanHide.NtQuerySystemInformation");
     DeleteTitanBreakpoint("TitanHide.NtSystemDebugControl");
     DeleteTitanBreakpoint("TitanHide.NtCreateThreadEx");
+    DeleteTitanBreakpoint("TitanHide.NtClose");
+    DeleteTitanBreakpoint("TitanHide.NtDuplicateObject");
+    DeleteTitanBreakpoint("TitanHide.NtGetContextThread");
+    DeleteTitanBreakpoint("TitanHide.NtSetContextThread");
     userHooksInstalled = false;
 }
 
@@ -269,6 +278,188 @@ static bool HandleNtSetInformationThread()
     return false;
 }
 
+
+
+static HANDLE DuplicateTargetHandle(duint handleValue, DWORD fallbackThreadId = 0)
+{
+    if(handleValue == (duint)-2 && fallbackThreadId)
+        return OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, fallbackThreadId);
+
+    if(!debuggeeProcess)
+        return nullptr;
+
+    HANDLE duplicate = nullptr;
+    if(!DuplicateHandle(debuggeeProcess,
+                        (HANDLE)(ULONG_PTR)handleValue,
+                        GetCurrentProcess(),
+                        &duplicate,
+                        0,
+                        FALSE,
+                        DUPLICATE_SAME_ACCESS))
+    {
+        return nullptr;
+    }
+    return duplicate;
+}
+
+static bool HandleNtClose()
+{
+    const ULONG options = GetTitanHideOptions();
+    if(!(options & HideNtClose))
+        return false;
+
+    const duint handleValue = DbgValFromString("rcx");
+    if(!handleValue)
+        return false;
+
+    HANDLE duplicate = DuplicateTargetHandle(handleValue);
+    if(!duplicate)
+    {
+        // STATUS_INVALID_HANDLE
+        return ReturnFromNtCall(0xC0000008u);
+    }
+
+    DWORD flags = 0;
+    const BOOL infoOk = GetHandleInformation(duplicate, &flags);
+    CloseHandle(duplicate);
+
+    if(infoOk && (flags & HANDLE_FLAG_PROTECT_FROM_CLOSE))
+    {
+        // STATUS_HANDLE_NOT_CLOSABLE
+        return ReturnFromNtCall(0xC0000235u);
+    }
+
+    return false;
+}
+
+static bool HandleNtDuplicateObject()
+{
+    const ULONG options = GetTitanHideOptions();
+    if(!(options & HideNtClose) || !debuggeeProcess)
+        return false;
+
+    const duint sourceProcessHandle = DbgValFromString("rcx");
+    const duint sourceHandle = DbgValFromString("rdx");
+
+    duint optionsValue = 0;
+    if(!ReadStackPointer(0x38, &optionsValue))
+        return false;
+
+    const ULONG DUPLICATE_CLOSE_SOURCE_FLAG = 0x1;
+    if(((ULONG)optionsValue & DUPLICATE_CLOSE_SOURCE_FLAG) == 0)
+        return false;
+
+    // Only sanitize handles that belong to the debuggee itself. This covers
+    // the anti-debug pattern handled by the original TitanHide path.
+    if(sourceProcessHandle != (duint)-1)
+        return false;
+
+    HANDLE duplicate = DuplicateTargetHandle(sourceHandle);
+    if(!duplicate)
+        return false;
+
+    DWORD flags = 0;
+    const BOOL infoOk = GetHandleInformation(duplicate, &flags);
+    CloseHandle(duplicate);
+
+    if(infoOk && (flags & HANDLE_FLAG_PROTECT_FROM_CLOSE))
+    {
+        ULONG sanitized = (ULONG)optionsValue & ~DUPLICATE_CLOSE_SOURCE_FLAG;
+        const duint rsp = DbgValFromString("rsp");
+        DbgMemWrite(rsp + 0x38, &sanitized, sizeof(sanitized));
+        _plugin_logputs("[" PLUGIN_NAME "] Cleared NtDuplicateObject DUPLICATE_CLOSE_SOURCE on protected handle");
+    }
+
+    return false;
+}
+
+static bool HandleNtGetContextThread()
+{
+    const ULONG options = GetTitanHideOptions();
+    if(!(options & HideNtGetContextThread))
+        return false;
+
+    const duint threadHandleValue = DbgValFromString("rcx");
+    const duint contextAddress = DbgValFromString("rdx");
+    if(!contextAddress)
+        return false;
+
+    CONTEXT context = {};
+    if(!DbgMemRead(contextAddress, &context, sizeof(context)))
+        return false;
+
+    const DWORD originalFlags = context.ContextFlags;
+    const bool wantsDebugRegisters = (originalFlags & CONTEXT_DEBUG_REGISTERS) != 0;
+    context.ContextFlags = originalFlags & ~CONTEXT_DEBUG_REGISTERS;
+
+    const DWORD currentTid = (DWORD)DbgValFromString("tid()");
+    HANDLE thread = DuplicateTargetHandle(threadHandleValue, currentTid);
+    if(!thread)
+        return false;
+
+    BOOL ok = GetThreadContext(thread, &context);
+    CloseHandle(thread);
+    if(!ok)
+        return false;
+
+    context.ContextFlags = originalFlags;
+    if(wantsDebugRegisters)
+    {
+        context.Dr0 = 0;
+        context.Dr1 = 0;
+        context.Dr2 = 0;
+        context.Dr3 = 0;
+        context.Dr6 = 0;
+        context.Dr7 = 0;
+#ifdef _WIN64
+        context.LastBranchToRip = 0;
+        context.LastBranchFromRip = 0;
+        context.LastExceptionToRip = 0;
+        context.LastExceptionFromRip = 0;
+#endif
+    }
+
+    if(!DbgMemWrite(contextAddress, &context, sizeof(context)))
+        return false;
+
+    return ReturnFromNtCall(0);
+}
+
+static bool HandleNtSetContextThread()
+{
+    const ULONG options = GetTitanHideOptions();
+    if(!(options & HideNtSetContextThread))
+        return false;
+
+    const duint threadHandleValue = DbgValFromString("rcx");
+    const duint contextAddress = DbgValFromString("rdx");
+    if(!contextAddress)
+        return false;
+
+    CONTEXT context = {};
+    if(!DbgMemRead(contextAddress, &context, sizeof(context)))
+        return false;
+
+    const DWORD originalFlags = context.ContextFlags;
+    context.ContextFlags = originalFlags & ~CONTEXT_DEBUG_REGISTERS;
+
+    const DWORD currentTid = (DWORD)DbgValFromString("tid()");
+    HANDLE thread = DuplicateTargetHandle(threadHandleValue, currentTid);
+    if(!thread)
+        return false;
+
+    BOOL ok = SetThreadContext(thread, &context);
+    CloseHandle(thread);
+
+    // Preserve the caller's input buffer exactly as the legacy hook did.
+    context.ContextFlags = originalFlags;
+    DbgMemWrite(contextAddress, &context, sizeof(context));
+
+    if(!ok)
+        return false;
+
+    return ReturnFromNtCall(0);
+}
 
 static bool HandleNtSystemDebugControl()
 {
@@ -506,6 +697,9 @@ static bool cbTitanHideName(int argc, char* argv[])
 PLUG_EXPORT void CBCREATEPROCESS(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info)
 {
     pid = info->fdProcessInfo->dwProcessId;
+    if(debuggeeProcess)
+        CloseHandle(debuggeeProcess);
+    debuggeeProcess = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     hidden = false;
     pebBackup = {};
 }
@@ -513,6 +707,9 @@ PLUG_EXPORT void CBCREATEPROCESS(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info)
 PLUG_EXPORT void CBATTACH(CBTYPE cbType, PLUG_CB_ATTACH* info)
 {
     pid = info->dwProcessId;
+    if(debuggeeProcess)
+        CloseHandle(debuggeeProcess);
+    debuggeeProcess = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     hidden = false;
     pebBackup = {};
 }
@@ -543,6 +740,14 @@ PLUG_EXPORT void CBBREAKPOINT(CBTYPE cbType, PLUG_CB_BREAKPOINT* info)
         handled = HandleNtSystemDebugControl();
     else if(strcmp(name, "TitanHide.NtCreateThreadEx") == 0)
         handled = HandleNtCreateThreadEx();
+    else if(strcmp(name, "TitanHide.NtClose") == 0)
+        handled = HandleNtClose();
+    else if(strcmp(name, "TitanHide.NtDuplicateObject") == 0)
+        handled = HandleNtDuplicateObject();
+    else if(strcmp(name, "TitanHide.NtGetContextThread") == 0)
+        handled = HandleNtGetContextThread();
+    else if(strcmp(name, "TitanHide.NtSetContextThread") == 0)
+        handled = HandleNtSetContextThread();
 
     if(handled)
         DbgCmdExecDirect("run");
@@ -556,6 +761,11 @@ PLUG_EXPORT void CBSTOPDEBUG(CBTYPE cbType, PLUG_CB_STOPDEBUG* info)
 {
     char* argv = "TitanUnhide";
     cbTitanUnhide(1, &argv);
+    if(debuggeeProcess)
+    {
+        CloseHandle(debuggeeProcess);
+        debuggeeProcess = nullptr;
+    }
 }
 
 void TitanHideInit(PLUG_INITSTRUCT* initStruct)
