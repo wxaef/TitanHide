@@ -118,3 +118,60 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 30
+
+
+  package-both:
+    name: Package x86 + x64
+    needs: build-plugin
+    runs-on: windows-2022
+
+    steps:
+      - name: Download x86 artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TitanHide-x64dbg-x86-*
+          path: combined/x86
+          merge-multiple: true
+
+      - name: Download x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TitanHide-x64dbg-x64-*
+          path: combined/x64
+          merge-multiple: true
+
+      - name: Assemble combined package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $out = Join-Path $env:GITHUB_WORKSPACE 'TitanHide-bundle'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $dp32 = Get-ChildItem -Path 'combined\x86' -Filter 'TitanHide.dp32' -Recurse | Select-Object -First 1
+          $dp64 = Get-ChildItem -Path 'combined\x64' -Filter 'TitanHide.dp64' -Recurse | Select-Object -First 1
+
+          if (-not $dp32) { throw 'TitanHide.dp32 not found' }
+          if (-not $dp64) { throw 'TitanHide.dp64 not found' }
+
+          Copy-Item $dp32.FullName (Join-Path $out 'TitanHide.dp32')
+          Copy-Item $dp64.FullName (Join-Path $out 'TitanHide.dp64')
+
+          @(
+            'TitanHide x32dbg/x64dbg bundle'
+            ''
+            'x32dbg: copy TitanHide.dp32 into the x32dbg plugins directory.'
+            'x64dbg: copy TitanHide.dp64 into the x64dbg plugins directory.'
+            ''
+            'Recommended for VMProtect testing:'
+            'TitanHideMode vmp'
+            'TitanHide'
+          ) | Set-Content -Path (Join-Path $out 'README.txt') -Encoding UTF8
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: TitanHide-x32-x64-bundle-${{ github.sha }}
+          path: TitanHide-bundle/
+          if-no-files-found: error
+          retention-days: 30
