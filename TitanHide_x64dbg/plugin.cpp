@@ -186,11 +186,11 @@ static bool ReturnFromNtCall(duint status)
     if(!rsp || !DbgMemRead(rsp, &returnAddress, sizeof(returnAddress)) || !returnAddress)
         return false;
 
-    if(!DbgValSetScalar("rax", status))
+    if(!DbgValToString("rax", status))
         return false;
-    if(!DbgValSetScalar("rsp", rsp + sizeof(duint)))
+    if(!DbgValToString("rsp", rsp + sizeof(duint)))
         return false;
-    if(!DbgValSetScalar("rip", returnAddress))
+    if(!DbgValToString("rip", returnAddress))
         return false;
 
     return true;
