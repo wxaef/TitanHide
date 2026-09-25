@@ -303,9 +303,16 @@ static HANDLE DuplicateTargetHandle(duint handleValue, DWORD fallbackThreadId = 
 }
 
 
+struct TH_UNICODE_STRING
+{
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+};
+
 struct TH_OBJECT_TYPE_INFORMATION
 {
-    UNICODE_STRING TypeName;
+    TH_UNICODE_STRING TypeName;
     ULONG TotalNumberOfObjects;
     ULONG TotalNumberOfHandles;
     ULONG TotalPagedPoolUsage;
@@ -881,7 +888,7 @@ PLUG_EXPORT void CBATTACH(CBTYPE cbType, PLUG_CB_ATTACH* info)
     pid = info->dwProcessId;
     if(debuggeeProcess)
         CloseHandle(debuggeeProcess);
-    debuggeeProcess = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    debuggeeProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
     hidden = false;
     pebBackup = {};
 }
