@@ -5,6 +5,21 @@
 #define _WIN32_WINNT 0x0501
 #endif
 
+/*
+ * PatchGuard-compatible mode
+ *
+ * On x64 this is enabled by default. The driver must not patch the SSDT,
+ * ntoskrnl code, or other PatchGuard-protected kernel structures.
+ *
+ * The legacy hook implementation remains in the source tree for reference,
+ * but it is not activated by the driver entry path while this mode is enabled.
+ */
+#ifdef _WIN64
+#define TITANHIDE_PATCHGUARD_COMPAT 1
+#else
+#define TITANHIDE_PATCHGUARD_COMPAT 0
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {

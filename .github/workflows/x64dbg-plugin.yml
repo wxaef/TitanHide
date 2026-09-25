@@ -1,0 +1,177 @@
+name: x64dbg Plugin
+
+on:
+  push:
+    branches:
+      - master
+      - patchguard-compatible
+    paths:
+      - 'TitanHide_x64dbg/**'
+      - 'TitanHide/TitanHide.h'
+      - '.github/workflows/x64dbg-plugin.yml'
+  pull_request:
+    paths:
+      - 'TitanHide_x64dbg/**'
+      - 'TitanHide/TitanHide.h'
+      - '.github/workflows/x64dbg-plugin.yml'
+  workflow_dispatch:
+
+jobs:
+  build-plugin:
+    name: Build ${{ matrix.label }} Release plugin
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            label: x64
+            output: x64\Release\plugins\TitanHide.dp64
+            machine: '0x8664'
+            artifact: TitanHide-x64dbg-x64
+          - platform: Win32
+            label: x86
+            output: Release\plugins\TitanHide.dp32
+            machine: '0x014c'
+            artifact: TitanHide-x64dbg-x86
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      - name: Build TitanHide x64dbg plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          msbuild.exe TitanHide.sln `
+            /m `
+            /verbosity:minimal `
+            "/t:TitanHide_x64dbg:Rebuild" `
+            /p:Configuration=Release `
+            /p:Platform=${{ matrix.platform }}
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Validate plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $plugin = Join-Path $env:GITHUB_WORKSPACE '${{ matrix.output }}'
+          if (-not (Test-Path $plugin)) {
+            throw "Expected plugin was not produced: $plugin"
+          }
+
+          $bytes = [IO.File]::ReadAllBytes($plugin)
+          if ($bytes.Length -lt 64) {
+            throw 'Plugin file is truncated'
+          }
+
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+            throw 'Invalid PE header'
+          }
+
+          if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550) {
+            throw 'Invalid PE signature'
+          }
+
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expected = [Convert]::ToUInt16('${{ matrix.machine }}'.Replace('0x',''), 16)
+          if ($machine -ne $expected) {
+            throw ('Expected machine ${{ matrix.machine }}, got 0x{0:X4}' -f $machine)
+          }
+
+          Get-Item $plugin | Format-List FullName, Length, LastWriteTime
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $artifact = Join-Path $env:GITHUB_WORKSPACE 'artifact'
+          New-Item -ItemType Directory -Force -Path $artifact | Out-Null
+          Copy-Item '${{ matrix.output }}' $artifact
+
+          @(
+            'TitanHide x64dbg plugin'
+            ''
+            'Architecture: ${{ matrix.label }}'
+            'Mode: driverless user mode by default.'
+            'Copy the plugin into the matching x32dbg/x64dbg plugins directory.'
+          ) | Set-Content -Path (Join-Path $artifact 'README.txt') -Encoding UTF8
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ github.sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+
+  package-both:
+    name: Package x86 + x64
+    needs: build-plugin
+    runs-on: windows-2022
+
+    steps:
+      - name: Download x86 artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TitanHide-x64dbg-x86-*
+          path: combined/x86
+          merge-multiple: true
+
+      - name: Download x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TitanHide-x64dbg-x64-*
+          path: combined/x64
+          merge-multiple: true
+
+      - name: Assemble combined package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $out = Join-Path $env:GITHUB_WORKSPACE 'TitanHide-bundle'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $dp32 = Get-ChildItem -Path 'combined\x86' -Filter 'TitanHide.dp32' -Recurse | Select-Object -First 1
+          $dp64 = Get-ChildItem -Path 'combined\x64' -Filter 'TitanHide.dp64' -Recurse | Select-Object -First 1
+
+          if (-not $dp32) { throw 'TitanHide.dp32 not found' }
+          if (-not $dp64) { throw 'TitanHide.dp64 not found' }
+
+          Copy-Item $dp32.FullName (Join-Path $out 'TitanHide.dp32')
+          Copy-Item $dp64.FullName (Join-Path $out 'TitanHide.dp64')
+
+          @(
+            'TitanHide x32dbg/x64dbg bundle'
+            ''
+            'x32dbg: copy TitanHide.dp32 into the x32dbg plugins directory.'
+            'x64dbg: copy TitanHide.dp64 into the x64dbg plugins directory.'
+            ''
+            'Recommended for VMProtect testing:'
+            'TitanHideMode vmp'
+            'TitanHide'
+          ) | Set-Content -Path (Join-Path $out 'README.txt') -Encoding UTF8
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: TitanHide-x32-x64-bundle-${{ github.sha }}
+          path: TitanHide-bundle/
+          if-no-files-found: error
+          retention-days: 30

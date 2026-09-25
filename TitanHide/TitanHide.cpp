@@ -15,8 +15,10 @@ static void DriverUnload(IN PDRIVER_OBJECT DriverObject)
 {
     IoDeleteSymbolicLink(&Win32Device);
     IoDeleteDevice(DriverObject->DeviceObject);
+#if !TITANHIDE_PATCHGUARD_COMPAT
     Hooks::Deinitialize();
     NTDLL::Deinitialize();
+#endif
 }
 
 static NTSTATUS DriverCreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
@@ -117,14 +119,14 @@ extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRI
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = DriverCreateClose;
     DriverObject->MajorFunction[IRP_MJ_WRITE] = DriverWrite;
 
-    //read ntdll.dll from disk so we can use it for exports
+#if !TITANHIDE_PATCHGUARD_COMPAT
+    // Legacy mode: load metadata and undocumented helpers used by kernel hooks.
     if(!NT_SUCCESS(NTDLL::Initialize()))
     {
         Log("[TITANHIDE] Ntdll::Initialize() failed...\r\n");
         return STATUS_UNSUCCESSFUL;
     }
 
-    //initialize undocumented APIs
     if(!Undocumented::UndocumentedInit())
     {
         Log("[TITANHIDE] UndocumentedInit() failed...\r\n");
@@ -132,13 +134,15 @@ extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRI
     }
     Log("[TITANHIDE] UndocumentedInit() was successful!\r\n");
 
-    //find the offset of CrossThreadFlags in ETHREAD
     status = FindCrossThreadFlagsOffset(&CrossThreadFlagsOffset);
     if(!NT_SUCCESS(status))
     {
         Log("[TITANHIDE] FindCrossThreadFlagsOffset() failed: 0x%lX\r\n", status);
         return status;
     }
+#else
+    Log("[TITANHIDE] PatchGuard-compatible mode enabled: kernel hooks and DKOM are disabled.\r\n");
+#endif
 
     //create io device
     status = IoCreateDevice(DriverObject,
@@ -171,8 +175,12 @@ extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRI
     }
     Log("[TITANHIDE] Symbolic link %.*ws->%.*ws created!\r\n", Win32Device.Length / sizeof(WCHAR), Win32Device.Buffer, DeviceName.Length / sizeof(WCHAR), DeviceName.Buffer);
 
-    //initialize hooking
+#if !TITANHIDE_PATCHGUARD_COMPAT
+    // Legacy SSDT/kernel-code hook path.
     Log("[TITANHIDE] Hooks::Initialize() hooked %d functions\r\n", Hooks::Initialize());
+#else
+    Log("[TITANHIDE] Running without SSDT/kernel-code hooks.\r\n");
+#endif
 
     return STATUS_SUCCESS;
 }
