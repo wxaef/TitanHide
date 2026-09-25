@@ -321,10 +321,26 @@ static bool HandleNtQuerySystemInformation()
     const ULONG outputLength = (ULONG)DbgValFromString("r8");
     const duint returnLengthPtr = DbgValFromString("r9");
 
+    if(!(options & HideSystemDebuggerInformation) || !output)
+        return false;
+
     // SystemKernelDebuggerInformation == 35.
-    if(infoClass == 35 && (options & HideSystemDebuggerInformation) && output && outputLength >= 2)
+    if(infoClass == 35 && outputLength >= 2)
     {
         BYTE info[2] = { FALSE, TRUE };
+        DbgMemWrite(output, info, sizeof(info));
+        if(returnLengthPtr)
+        {
+            ULONG length = sizeof(info);
+            DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+        }
+        return ReturnFromNtCall(0);
+    }
+
+    // SystemKernelDebuggerInformationEx == 149 on current NT definitions.
+    if(infoClass == 149 && outputLength >= 3)
+    {
+        BYTE info[3] = { FALSE, FALSE, FALSE };
         DbgMemWrite(output, info, sizeof(info));
         if(returnLengthPtr)
         {
