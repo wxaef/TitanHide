@@ -17,10 +17,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-x64-plugin:
-    name: Build x64 Release plugin
+  build-plugin:
+    name: Build ${{ matrix.label }} Release plugin
     runs-on: windows-2022
     timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            label: x64
+            output: x64\Release\plugins\TitanHide.dp64
+            machine: '0x8664'
+            artifact: TitanHide-x64dbg-x64
+          - platform: Win32
+            label: x86
+            output: Release\plugins\TitanHide.dp32
+            machine: '0x014c'
+            artifact: TitanHide-x64dbg-x86
 
     steps:
       - name: Checkout
@@ -41,7 +56,7 @@ jobs:
             /verbosity:minimal `
             "/t:TitanHide_x64dbg:Rebuild" `
             /p:Configuration=Release `
-            /p:Platform=x64
+            /p:Platform=${{ matrix.platform }}
 
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
@@ -52,7 +67,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $plugin = Join-Path $env:GITHUB_WORKSPACE 'x64\Release\plugins\TitanHide.dp64'
+          $plugin = Join-Path $env:GITHUB_WORKSPACE '${{ matrix.output }}'
           if (-not (Test-Path $plugin)) {
             throw "Expected plugin was not produced: $plugin"
           }
@@ -72,8 +87,9 @@ jobs:
           }
 
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
-          if ($machine -ne 0x8664) {
-            throw ('Expected AMD64 PE machine 0x8664, got 0x{0:X4}' -f $machine)
+          $expected = [Convert]::ToUInt16('${{ matrix.machine }}'.Replace('0x',''), 16)
+          if ($machine -ne $expected) {
+            throw ('Expected machine ${{ matrix.machine }}, got 0x{0:X4}' -f $machine)
           }
 
           Get-Item $plugin | Format-List FullName, Length, LastWriteTime
@@ -85,19 +101,20 @@ jobs:
 
           $artifact = Join-Path $env:GITHUB_WORKSPACE 'artifact'
           New-Item -ItemType Directory -Force -Path $artifact | Out-Null
-          Copy-Item 'x64\Release\plugins\TitanHide.dp64' $artifact
+          Copy-Item '${{ matrix.output }}' $artifact
 
           @(
             'TitanHide x64dbg plugin'
             ''
-            'Mode: driverless/PatchGuard-compatible user mode by default on x64.'
-            'Copy TitanHide.dp64 into the x64dbg x64 plugins directory.'
+            'Architecture: ${{ matrix.label }}'
+            'Mode: driverless user mode by default.'
+            'Copy the plugin into the matching x32dbg/x64dbg plugins directory.'
           ) | Set-Content -Path (Join-Path $artifact 'README.txt') -Encoding UTF8
 
-      - name: Upload x64dbg plugin
+      - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: TitanHide-x64dbg-x64-${{ github.sha }}
+          name: ${{ matrix.artifact }}-${{ github.sha }}
           path: artifact/
           if-no-files-found: error
           retention-days: 30
