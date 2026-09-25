@@ -2,7 +2,7 @@
 
 # Overview
 
-TitanHide is a driver intended to hide debuggers from certain processes. The driver hooks various Nt* kernel functions (using SSDT table hooks) and modifies the return values of the original functions. To hide a process, you must pass a simple structure with a ProcessID and the hiding option(s) to enable, to the driver. The internal API is designed to add hooks with little effort, which means adding features is really easy.
+This branch contains two modes of interest: the original TitanHide implementation and an x64 PatchGuard-compatible driver mode. The compatibility mode keeps the device/control path but does not activate the legacy SSDT, kernel code-patching, or DKOM paths. Legacy hiding logic remains in the source tree for reference and migration to supported user-mode debugger/plugin techniques.
 
 The idea for this project was thought of together with cypher, shoutout man!
 
@@ -34,20 +34,30 @@ The idea for this project was thought of together with cypher, shoutout man!
 
 # Requirements
 
-**You need to disable PatchGuard and driver signing enforcement (DSE) before using this driver.**
+## PatchGuard-compatible x64 mode
 
-To disable PatchGuard you can try one of the following projects:
+This branch enables a PatchGuard-compatible mode by default on x64.
 
-- [EfiGuard](https://github.com/Mattiwatti/EfiGuard)
-- [SandboxBootkit](https://github.com/thesecretclub/SandboxBootkit)
-- [Shark](https://github.com/9176324/Shark)
-- [UPGDSED](https://github.com/hfiref0x/UPGDSED) (archived in 2019)
+In this mode TitanHide does **not**:
 
-To load the driver you can enable test signing:
+- patch the SSDT;
+- overwrite `ntoskrnl.exe` code;
+- use the legacy kernel code-cave hook path;
+- modify `ETHREAD.CrossThreadFlags` through the legacy DKOM path.
 
-```sh
-bcdedit /set testsigning on
-```
+You therefore do **not** need to disable PatchGuard to load and run the compatibility-mode driver.
+
+> Important: the legacy kernel-hook implementation is still present in the source tree for reference, but it is not activated by the x64 driver entry path in this branch.
+
+Because the legacy global Nt* interception is disabled, kernel-backed hiding features that depended on those hooks are not provided by the compatibility-mode driver. Those features should be implemented in the debugger/user-mode plugin layer instead of by patching protected kernel structures.
+
+## Driver signing / DSE
+
+Do not disable Driver Signature Enforcement for normal use.
+
+Windows still requires a kernel driver to have a signature trusted by the platform. For a normal end-user build, sign and submit the driver through the supported Microsoft driver-signing process and install the resulting signed `TitanHide.sys`.
+
+An unsigned local development build will **not** load on a stock Windows installation with DSE enabled. Test-signing mode is only a development option and is not required for a properly signed release build.
 
 # Installation
 
