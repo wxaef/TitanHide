@@ -8,6 +8,71 @@ static DWORD pid = 0;
 static bool hidden = false;
 static std::string driverName = "TitanHide";
 
+enum TITANHIDE_MODE
+{
+    TitanHideModeAuto,
+    TitanHideModeDriver,
+    TitanHideModeUser
+};
+
+static TITANHIDE_MODE mode = TitanHideModeAuto;
+
+static const char* ModeName(TITANHIDE_MODE value)
+{
+    switch(value)
+    {
+    case TitanHideModeDriver:
+        return "driver";
+    case TitanHideModeUser:
+        return "user";
+    default:
+        return "auto";
+    }
+}
+
+static bool PatchPebAntiDebug()
+{
+    const duint peb = DbgValFromString("peb()");
+    if(!peb)
+    {
+        _plugin_logputs("[" PLUGIN_NAME "] Could not resolve PEB address");
+        return false;
+    }
+
+    BYTE beingDebugged = 0;
+    if(!DbgMemWrite(peb + 2, &beingDebugged, sizeof(beingDebugged)))
+    {
+        _plugin_logputs("[" PLUGIN_NAME "] Failed to clear PEB.BeingDebugged");
+        return false;
+    }
+
+#ifdef _WIN64
+    const duint ntGlobalFlagOffset = 0xBC;
+#else
+    const duint ntGlobalFlagOffset = 0x68;
+#endif
+
+    DWORD ntGlobalFlag = 0;
+    if(DbgMemRead(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag)))
+    {
+        // Clear the three classic debug-heap creation flags while preserving
+        // unrelated process flags.
+        ntGlobalFlag &= ~(0x10u | 0x20u | 0x40u);
+        DbgMemWrite(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag));
+    }
+
+    _plugin_logprintf("[" PLUGIN_NAME "] User-mode PEB anti-debug flags cleared at %p\n", (void*)peb);
+    return true;
+}
+
+static bool ApplyUserModeHide()
+{
+    // x64dbg's built-in hide command handles debugger-side user-mode hiding.
+    const bool commandOk = DbgCmdExecDirect("hide");
+    const bool pebOk = PatchPebAntiDebug();
+    return commandOk || pebOk;
+}
+
 static ULONG GetTitanHideOptions()
 {
     duint options = 0;
@@ -46,27 +111,81 @@ static bool TitanHideCall(HIDE_COMMAND Command)
 
 static bool cbTitanHide(int argc, char* argv[])
 {
-    if (!hidden)
+    if(hidden)
+        return true;
+
+    _plugin_logprintf("[" PLUGIN_NAME "] Hiding PID %X (%ud), mode=%s\n", pid, pid, ModeName(mode));
+
+    bool result = false;
+    if(mode == TitanHideModeDriver)
     {
-        _plugin_logprintf("[" PLUGIN_NAME "] Hiding PID %X (%ud)\n", pid, pid);
-        if (TitanHideCall(HidePid))
+        result = TitanHideCall(HidePid);
+        if(result)
+            ApplyUserModeHide();
+    }
+    else if(mode == TitanHideModeUser)
+    {
+        result = ApplyUserModeHide();
+    }
+    else
+    {
+        // Auto mode prefers the legacy driver when available, but gracefully
+        // falls back to the PatchGuard/DSE-friendly user-mode path.
+        result = TitanHideCall(HidePid);
+        if(result)
+            ApplyUserModeHide();
+        else
         {
-            DbgCmdExecDirect("hide");
-            hidden = true;
+            _plugin_logputs("[" PLUGIN_NAME "] Driver unavailable; falling back to user-mode compatibility mode");
+            result = ApplyUserModeHide();
         }
     }
+
+    hidden = result;
     return hidden;
 }
 
 static bool cbTitanUnhide(int argc, char* argv[])
 {
-    if (hidden)
+    if(!hidden)
+        return true;
+
+    _plugin_logprintf("[" PLUGIN_NAME "] Unhiding PID %X (%ud)\n", pid, pid);
+
+    // User-mode PEB changes cannot be reliably reconstructed without keeping
+    // the original values. Stop applying additional hiding for this session.
+    if(mode == TitanHideModeDriver)
+        TitanHideCall(UnhidePid);
+    else if(mode == TitanHideModeAuto)
+        TitanHideCall(UnhidePid);
+
+    hidden = false;
+    return true;
+}
+
+static bool cbTitanHideMode(int argc, char* argv[])
+{
+    if(argc < 2)
     {
-        _plugin_logprintf("[" PLUGIN_NAME "] Unhiding PID %X (%ud)\n", pid, pid);
-        if (TitanHideCall(UnhidePid))
-            hidden = false;
+        _plugin_logprintf("[" PLUGIN_NAME "] Current mode: %s\n", ModeName(mode));
+        return true;
     }
-    return !hidden;
+
+    if(_stricmp(argv[1], "auto") == 0)
+        mode = TitanHideModeAuto;
+    else if(_stricmp(argv[1], "driver") == 0)
+        mode = TitanHideModeDriver;
+    else if(_stricmp(argv[1], "user") == 0 || _stricmp(argv[1], "compat") == 0)
+        mode = TitanHideModeUser;
+    else
+    {
+        _plugin_logputs("[" PLUGIN_NAME "] Usage: TitanHideMode auto|driver|user");
+        return false;
+    }
+
+    BridgeSettingSetUint("TitanHide", "Mode", (duint)mode);
+    _plugin_logprintf("[" PLUGIN_NAME "] New mode: %s\n", ModeName(mode));
+    return true;
 }
 
 static bool cbTitanHideOptions(int argc, char* argv[])
@@ -132,14 +251,21 @@ void TitanHideInit(PLUG_INITSTRUCT* initStruct)
         driverName = setting;
     }
 
+    duint savedMode = 0;
+    if(BridgeSettingGetUint("TitanHide", "Mode", &savedMode) && savedMode <= TitanHideModeUser)
+        mode = (TITANHIDE_MODE)savedMode;
+
     _plugin_registercommand(pluginHandle, "TitanHide", cbTitanHide, true);
     _plugin_registercommand(pluginHandle, "TitanUnhide", cbTitanUnhide, true);
     _plugin_registercommand(pluginHandle, "TitanHideOptions", cbTitanHideOptions, false);
     _plugin_registercommand(pluginHandle, "TitanHideName", cbTitanHideName, false);
+    _plugin_registercommand(pluginHandle, "TitanHideMode", cbTitanHideMode, false);
 }
 
 void TitanHideStop()
 {
+    _plugin_unregistercommand(pluginHandle, "TitanHideMode");
+    _plugin_unregistercommand(pluginHandle, "TitanHideName");
     _plugin_unregistercommand(pluginHandle, "TitanHideOptions");
     _plugin_unregistercommand(pluginHandle, "TitanUnhide");
     _plugin_unregistercommand(pluginHandle, "TitanHide");
