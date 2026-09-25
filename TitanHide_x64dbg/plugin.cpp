@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string>
+#include <vector>
 #include "../TitanHide/TitanHide.h"
 
 static DWORD pid = 0;
@@ -159,6 +160,7 @@ static bool InstallUserApiHooks()
     ok &= SetTitanBreakpoint("NtDuplicateObject", "TitanHide.NtDuplicateObject");
     ok &= SetTitanBreakpoint("NtGetContextThread", "TitanHide.NtGetContextThread");
     ok &= SetTitanBreakpoint("NtSetContextThread", "TitanHide.NtSetContextThread");
+    ok &= SetTitanBreakpoint("NtQueryObject", "TitanHide.NtQueryObject");
 
     userHooksInstalled = ok;
     _plugin_logprintf("[" PLUGIN_NAME "] User-mode Nt* interception %s\n", ok ? "enabled" : "partially failed");
@@ -167,9 +169,6 @@ static bool InstallUserApiHooks()
 
 static void RemoveUserApiHooks()
 {
-    if(!userHooksInstalled)
-        return;
-
     DeleteTitanBreakpoint("TitanHide.NtQueryInformationProcess");
     DeleteTitanBreakpoint("TitanHide.NtSetInformationThread");
     DeleteTitanBreakpoint("TitanHide.NtQuerySystemInformation");
@@ -179,6 +178,7 @@ static void RemoveUserApiHooks()
     DeleteTitanBreakpoint("TitanHide.NtDuplicateObject");
     DeleteTitanBreakpoint("TitanHide.NtGetContextThread");
     DeleteTitanBreakpoint("TitanHide.NtSetContextThread");
+    DeleteTitanBreakpoint("TitanHide.NtQueryObject");
     userHooksInstalled = false;
 }
 
@@ -302,6 +302,178 @@ static HANDLE DuplicateTargetHandle(duint handleValue, DWORD fallbackThreadId = 
     return duplicate;
 }
 
+
+struct TH_OBJECT_TYPE_INFORMATION
+{
+    UNICODE_STRING TypeName;
+    ULONG TotalNumberOfObjects;
+    ULONG TotalNumberOfHandles;
+    ULONG TotalPagedPoolUsage;
+    ULONG TotalNonPagedPoolUsage;
+    ULONG TotalNamePoolUsage;
+    ULONG TotalHandleTableUsage;
+    ULONG HighWaterNumberOfObjects;
+    ULONG HighWaterNumberOfHandles;
+    ULONG HighWaterPagedPoolUsage;
+    ULONG HighWaterNonPagedPoolUsage;
+    ULONG HighWaterNamePoolUsage;
+    ULONG HighWaterHandleTableUsage;
+    ULONG InvalidAttributes;
+    GENERIC_MAPPING GenericMapping;
+    ULONG ValidAccessMask;
+    BOOLEAN SecurityRequired;
+    BOOLEAN MaintainHandleCount;
+    UCHAR TypeIndex;
+    CHAR ReservedByte;
+    ULONG PoolType;
+    ULONG DefaultPagedPoolCharge;
+    ULONG DefaultNonPagedPoolCharge;
+};
+
+struct TH_OBJECT_TYPES_INFORMATION
+{
+    ULONG NumberOfTypes;
+    TH_OBJECT_TYPE_INFORMATION TypeInformation[1];
+};
+
+typedef LONG (NTAPI* TH_NT_QUERY_OBJECT)(
+    HANDLE Handle,
+    ULONG ObjectInformationClass,
+    PVOID ObjectInformation,
+    ULONG ObjectInformationLength,
+    PULONG ReturnLength);
+
+static TH_NT_QUERY_OBJECT ResolveNtQueryObject()
+{
+    static TH_NT_QUERY_OBJECT fn = (TH_NT_QUERY_OBJECT)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+    return fn;
+}
+
+static bool IsDebugObjectType(const TH_OBJECT_TYPE_INFORMATION* info)
+{
+    static const wchar_t name[] = L"DebugObject";
+    const USHORT nameBytes = (USHORT)((ARRAYSIZE(name) - 1) * sizeof(wchar_t));
+    return info &&
+           info->TypeName.Buffer &&
+           info->TypeName.Length == nameBytes &&
+           wmemcmp(info->TypeName.Buffer, name, ARRAYSIZE(name) - 1) == 0;
+}
+
+static void RelocateTypeNamePointer(
+    TH_OBJECT_TYPE_INFORMATION* info,
+    const BYTE* localBase,
+    size_t localSize,
+    duint remoteBase)
+{
+    if(!info || !info->TypeName.Buffer)
+        return;
+
+    const BYTE* ptr = (const BYTE*)info->TypeName.Buffer;
+    if(ptr >= localBase && ptr < localBase + localSize)
+        info->TypeName.Buffer = (PWSTR)(ULONG_PTR)(remoteBase + (duint)(ptr - localBase));
+}
+
+static bool HandleNtQueryObject()
+{
+    const ULONG options = GetTitanHideOptions();
+    if(!(options & HideDebugObject))
+        return false;
+
+    const duint handleValue = DbgValFromString("rcx");
+    const ULONG infoClass = (ULONG)DbgValFromString("rdx");
+    const duint output = DbgValFromString("r8");
+    const ULONG outputLength = (ULONG)DbgValFromString("r9");
+
+    if((infoClass != 2 && infoClass != 3) || !output || !outputLength)
+        return false;
+
+    duint returnLengthPtr = 0;
+    ReadStackPointer(0x28, &returnLengthPtr);
+
+    TH_NT_QUERY_OBJECT ntQueryObject = ResolveNtQueryObject();
+    if(!ntQueryObject)
+        return false;
+
+    HANDLE localHandle = nullptr;
+    if(infoClass == 2)
+    {
+        localHandle = DuplicateTargetHandle(handleValue);
+        if(!localHandle)
+            return false;
+    }
+
+    std::vector<BYTE> buffer(outputLength);
+    ULONG returnLength = 0;
+    LONG status = ntQueryObject(
+        infoClass == 2 ? localHandle : nullptr,
+        infoClass,
+        buffer.data(),
+        outputLength,
+        &returnLength);
+
+    if(localHandle)
+        CloseHandle(localHandle);
+
+    if(returnLengthPtr)
+        DbgMemWrite(returnLengthPtr, &returnLength, sizeof(returnLength));
+
+    if(status >= 0)
+    {
+        if(infoClass == 2)
+        {
+            TH_OBJECT_TYPE_INFORMATION* info = (TH_OBJECT_TYPE_INFORMATION*)buffer.data();
+            if(IsDebugObjectType(info))
+            {
+                if(info->TotalNumberOfObjects)
+                    info->TotalNumberOfObjects--;
+
+                // The local DuplicateHandle temporarily contributes one handle;
+                // subtract it plus one debugger contribution where possible.
+                if(info->TotalNumberOfHandles >= 2)
+                    info->TotalNumberOfHandles -= 2;
+                else
+                    info->TotalNumberOfHandles = 0;
+            }
+
+            RelocateTypeNamePointer(info, buffer.data(), buffer.size(), output);
+        }
+        else
+        {
+            TH_OBJECT_TYPES_INFORMATION* all = (TH_OBJECT_TYPES_INFORMATION*)buffer.data();
+            TH_OBJECT_TYPE_INFORMATION* info = all->TypeInformation;
+
+            for(ULONG i = 0; i < all->NumberOfTypes; i++)
+            {
+                if((BYTE*)info < buffer.data() ||
+                   (BYTE*)info + sizeof(TH_OBJECT_TYPE_INFORMATION) > buffer.data() + buffer.size())
+                    break;
+
+                if(IsDebugObjectType(info))
+                {
+                    // Match established user-mode anti-anti-debug behavior:
+                    // hide global DebugObject counts in all-types queries.
+                    info->TotalNumberOfObjects = 0;
+                    info->TotalNumberOfHandles = 0;
+                }
+
+                RelocateTypeNamePointer(info, buffer.data(), buffer.size(), output);
+
+                BYTE* next = (BYTE*)(info + 1);
+                const size_t alignedName = (info->TypeName.MaximumLength + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+                next += alignedName;
+                info = (TH_OBJECT_TYPE_INFORMATION*)next;
+            }
+        }
+
+                size_t copyLength = returnLength ? (size_t)returnLength : buffer.size();
+        if(copyLength > buffer.size())
+            copyLength = buffer.size();
+        DbgMemWrite(output, buffer.data(), (duint)copyLength);
+    }
+
+    return ReturnFromNtCall((duint)(ULONG)status);
+}
+
 static bool HandleNtClose()
 {
     const ULONG options = GetTitanHideOptions();
@@ -390,7 +562,7 @@ static bool HandleNtGetContextThread()
 
     const DWORD originalFlags = context.ContextFlags;
     const bool wantsDebugRegisters = (originalFlags & CONTEXT_DEBUG_REGISTERS) != 0;
-    context.ContextFlags = originalFlags & ~CONTEXT_DEBUG_REGISTERS;
+    context.ContextFlags = originalFlags & ~0x10u; // preserve architecture bit, clear debug-register request
 
     const DWORD currentTid = (DWORD)DbgValFromString("tid()");
     HANDLE thread = DuplicateTargetHandle(threadHandleValue, currentTid);
@@ -441,7 +613,7 @@ static bool HandleNtSetContextThread()
         return false;
 
     const DWORD originalFlags = context.ContextFlags;
-    context.ContextFlags = originalFlags & ~CONTEXT_DEBUG_REGISTERS;
+    context.ContextFlags = originalFlags & ~0x10u; // preserve architecture bit, clear debug-register request
 
     const DWORD currentTid = (DWORD)DbgValFromString("tid()");
     HANDLE thread = DuplicateTargetHandle(threadHandleValue, currentTid);
@@ -699,7 +871,7 @@ PLUG_EXPORT void CBCREATEPROCESS(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info)
     pid = info->fdProcessInfo->dwProcessId;
     if(debuggeeProcess)
         CloseHandle(debuggeeProcess);
-    debuggeeProcess = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    debuggeeProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
     hidden = false;
     pebBackup = {};
 }
@@ -748,6 +920,8 @@ PLUG_EXPORT void CBBREAKPOINT(CBTYPE cbType, PLUG_CB_BREAKPOINT* info)
         handled = HandleNtGetContextThread();
     else if(strcmp(name, "TitanHide.NtSetContextThread") == 0)
         handled = HandleNtSetContextThread();
+    else if(strcmp(name, "TitanHide.NtQueryObject") == 0)
+        handled = HandleNtQueryObject();
 
     if(handled)
         DbgCmdExecDirect("run");
