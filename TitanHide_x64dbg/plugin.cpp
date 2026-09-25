@@ -8,6 +8,8 @@ static DWORD pid = 0;
 static bool hidden = false;
 static std::string driverName = "TitanHide";
 
+static ULONG GetTitanHideOptions();
+
 enum TITANHIDE_MODE
 {
     TitanHideModeAuto,
@@ -95,7 +97,12 @@ static bool ApplyUserModeHide()
     // x64dbg's built-in hide command handles debugger-side user-mode hiding.
     const bool commandOk = DbgCmdExecDirect("hide");
     const bool pebOk = PatchPebAntiDebug();
-    return commandOk || pebOk;
+#ifdef _WIN64
+    const bool hooksOk = InstallUserApiHooks();
+#else
+    const bool hooksOk = false;
+#endif
+    return commandOk || pebOk || hooksOk;
 }
 
 static void RestorePebAntiDebug()
@@ -113,6 +120,171 @@ static void RestorePebAntiDebug()
     DbgMemWrite(pebBackup.peb + ntGlobalFlagOffset, &pebBackup.ntGlobalFlag, sizeof(pebBackup.ntGlobalFlag));
     pebBackup = {};
 }
+
+
+#ifdef _WIN64
+static bool userHooksInstalled = false;
+
+static bool SetTitanBreakpoint(const char* api, const char* name)
+{
+    char command[512] = {};
+    sprintf_s(command, "bp \"ntdll.dll:%s\",\"%s\"", api, name);
+    return DbgCmdExecDirect(command);
+}
+
+static void DeleteTitanBreakpoint(const char* name)
+{
+    char command[256] = {};
+    sprintf_s(command, "bc \"%s\"", name);
+    DbgCmdExecDirect(command);
+}
+
+static bool InstallUserApiHooks()
+{
+    if(userHooksInstalled)
+        return true;
+
+    bool ok = true;
+    ok &= SetTitanBreakpoint("NtQueryInformationProcess", "TitanHide.NtQueryInformationProcess");
+    ok &= SetTitanBreakpoint("NtSetInformationThread", "TitanHide.NtSetInformationThread");
+    ok &= SetTitanBreakpoint("NtQuerySystemInformation", "TitanHide.NtQuerySystemInformation");
+
+    userHooksInstalled = ok;
+    _plugin_logprintf("[" PLUGIN_NAME "] User-mode Nt* interception %s\n", ok ? "enabled" : "partially failed");
+    return ok;
+}
+
+static void RemoveUserApiHooks()
+{
+    if(!userHooksInstalled)
+        return;
+
+    DeleteTitanBreakpoint("TitanHide.NtQueryInformationProcess");
+    DeleteTitanBreakpoint("TitanHide.NtSetInformationThread");
+    DeleteTitanBreakpoint("TitanHide.NtQuerySystemInformation");
+    userHooksInstalled = false;
+}
+
+static bool ReadStackPointer(duint offset, duint* value)
+{
+    const duint rsp = DbgValFromString("rsp");
+    return rsp != 0 && DbgMemRead(rsp + offset, value, sizeof(*value));
+}
+
+static bool ReturnFromNtCall(duint status)
+{
+    const duint rsp = DbgValFromString("rsp");
+    duint returnAddress = 0;
+    if(!rsp || !DbgMemRead(rsp, &returnAddress, sizeof(returnAddress)) || !returnAddress)
+        return false;
+
+    if(!DbgValSetScalar("rax", status))
+        return false;
+    if(!DbgValSetScalar("rsp", rsp + sizeof(duint)))
+        return false;
+    if(!DbgValSetScalar("rip", returnAddress))
+        return false;
+
+    return true;
+}
+
+static bool HandleNtQueryInformationProcess()
+{
+    const ULONG options = GetTitanHideOptions();
+    const ULONG infoClass = (ULONG)DbgValFromString("rdx");
+    const duint output = DbgValFromString("r8");
+    const ULONG outputLength = (ULONG)DbgValFromString("r9");
+
+    duint returnLengthPtr = 0;
+    ReadStackPointer(0x28, &returnLengthPtr);
+
+    // PROCESSINFOCLASS values used by Windows anti-debug checks.
+    if(infoClass == 7 && (options & HideProcessDebugPort))
+    {
+        if(output && outputLength >= sizeof(duint))
+        {
+            duint value = 0;
+            DbgMemWrite(output, &value, sizeof(value));
+            if(returnLengthPtr)
+            {
+                ULONG length = (ULONG)sizeof(duint);
+                DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+            }
+            return ReturnFromNtCall(0);
+        }
+    }
+    else if(infoClass == 30 && (options & HideProcessDebugObjectHandle))
+    {
+        if(output && outputLength >= sizeof(duint))
+        {
+            duint value = 0;
+            DbgMemWrite(output, &value, sizeof(value));
+            if(returnLengthPtr)
+            {
+                ULONG length = (ULONG)sizeof(duint);
+                DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+            }
+
+            // STATUS_PORT_NOT_SET
+            return ReturnFromNtCall(0xC0000353u);
+        }
+    }
+    else if(infoClass == 31 && (options & HideProcessDebugFlags))
+    {
+        if(output && outputLength >= sizeof(ULONG))
+        {
+            ULONG value = TRUE;
+            DbgMemWrite(output, &value, sizeof(value));
+            if(returnLengthPtr)
+            {
+                ULONG length = sizeof(ULONG);
+                DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+            }
+            return ReturnFromNtCall(0);
+        }
+    }
+
+    return false;
+}
+
+static bool HandleNtSetInformationThread()
+{
+    const ULONG options = GetTitanHideOptions();
+    const ULONG infoClass = (ULONG)DbgValFromString("rdx");
+    const ULONG infoLength = (ULONG)DbgValFromString("r9");
+
+    // ThreadHideFromDebugger == 0x11. Pretend the request succeeded without
+    // actually hiding the thread from the debugger.
+    if(infoClass == 0x11 && infoLength == 0 && (options & HideThreadHideFromDebugger))
+        return ReturnFromNtCall(0);
+
+    return false;
+}
+
+static bool HandleNtQuerySystemInformation()
+{
+    const ULONG options = GetTitanHideOptions();
+    const ULONG infoClass = (ULONG)DbgValFromString("rcx");
+    const duint output = DbgValFromString("rdx");
+    const ULONG outputLength = (ULONG)DbgValFromString("r8");
+    const duint returnLengthPtr = DbgValFromString("r9");
+
+    // SystemKernelDebuggerInformation == 35.
+    if(infoClass == 35 && (options & HideSystemDebuggerInformation) && output && outputLength >= 2)
+    {
+        BYTE info[2] = { FALSE, TRUE };
+        DbgMemWrite(output, info, sizeof(info));
+        if(returnLengthPtr)
+        {
+            ULONG length = sizeof(info);
+            DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+        }
+        return ReturnFromNtCall(0);
+    }
+
+    return false;
+}
+#endif
 
 static ULONG GetTitanHideOptions()
 {
@@ -198,6 +370,9 @@ static bool cbTitanUnhide(int argc, char* argv[])
     else if(mode == TitanHideModeAuto)
         TitanHideCall(UnhidePid);
 
+#ifdef _WIN64
+    RemoveUserApiHooks();
+#endif
     RestorePebAntiDebug();
     hidden = false;
     return true;
@@ -280,6 +455,31 @@ PLUG_EXPORT void CBSYSTEMBREAKPOINT(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* inf
     cbTitanHide(1, &argv);
 }
 
+
+PLUG_EXPORT void CBBREAKPOINT(CBTYPE cbType, PLUG_CB_BREAKPOINT* info)
+{
+#ifdef _WIN64
+    if(!hidden || !info || !info->breakpoint || mode == TitanHideModeDriver)
+        return;
+
+    const char* name = info->breakpoint->name;
+    bool handled = false;
+
+    if(strcmp(name, "TitanHide.NtQueryInformationProcess") == 0)
+        handled = HandleNtQueryInformationProcess();
+    else if(strcmp(name, "TitanHide.NtSetInformationThread") == 0)
+        handled = HandleNtSetInformationThread();
+    else if(strcmp(name, "TitanHide.NtQuerySystemInformation") == 0)
+        handled = HandleNtQuerySystemInformation();
+
+    if(handled)
+        DbgCmdExecDirect("run");
+#else
+    UNREFERENCED_PARAMETER(cbType);
+    UNREFERENCED_PARAMETER(info);
+#endif
+}
+
 PLUG_EXPORT void CBSTOPDEBUG(CBTYPE cbType, PLUG_CB_STOPDEBUG* info)
 {
     char* argv = "TitanUnhide";
@@ -308,6 +508,9 @@ void TitanHideInit(PLUG_INITSTRUCT* initStruct)
 
 void TitanHideStop()
 {
+#ifdef _WIN64
+    RemoveUserApiHooks();
+#endif
     _plugin_unregistercommand(pluginHandle, "TitanHideMode");
     _plugin_unregistercommand(pluginHandle, "TitanHideName");
     _plugin_unregistercommand(pluginHandle, "TitanHideOptions");
