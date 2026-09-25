@@ -2,7 +2,7 @@
 
 This branch keeps the original TitanHide source for reference, but changes the recommended x64 design so normal use does **not** require disabling PatchGuard or Driver Signature Enforcement.
 
-The recommended path is now the x64dbg plugin in **driverless user mode**.
+The recommended path is now the x32dbg/x64dbg plugin in **driverless user mode**.
 
 ## What changed
 
@@ -27,7 +27,7 @@ In x64dbg:
 TitanHideMode user
 ```
 
-On x64 this branch defaults to `user` mode.
+Both x86 and x64 plugin builds default to `user` mode.
 
 ### Available modes
 
@@ -67,9 +67,9 @@ If you want to load `TitanHide.sys` on a normal Windows installation with DSE en
 
 An unsigned development `.sys` will not load on stock Windows with DSE enabled. Test-signing is a development option, not a requirement for a properly signed release driver.
 
-## x64 user-mode compatibility features
+## x86/x64 user-mode compatibility features
 
-The x64dbg plugin currently provides:
+The x32dbg/x64dbg plugins currently provide:
 
 | Feature | Status |
 | --- | --- |
@@ -187,8 +187,8 @@ For driverless use, the important output is the x64dbg plugin. A kernel driver i
 
 ## Driverless installation
 
-1. Build the x64 TitanHide x64dbg plugin.
-2. Copy the plugin to the appropriate x64dbg plugin directory.
+1. Build the TitanHide debugger plugin for the target architecture.
+2. Copy `TitanHide.dp32` to the x32dbg plugin directory, or `TitanHide.dp64` to the x64dbg plugin directory.
 3. Start x64dbg.
 4. Start or attach to the target.
 5. The x64 build defaults to user mode, or explicitly run:
@@ -215,9 +215,13 @@ The compatibility x64 driver intentionally does not activate the legacy SSDT/ker
 
 ## Current scope
 
-This branch primarily targets modern **Windows x64 + x64dbg**.
+This branch targets both **x32dbg (32-bit)** and **x64dbg (64-bit)**.
 
-The repository still contains the historical x86/older-Windows implementation, but the new driverless Nt* compatibility layer is currently x64-specific.
+The driverless Nt* compatibility layer uses architecture-aware argument handling:
+- x64: RCX/RDX/R8/R9 plus the x64 stack calling convention;
+- x86: stdcall arguments from the debuggee stack.
+
+GitHub Actions builds and validates both `TitanHide.dp32` and `TitanHide.dp64`.
 
 ## Safety / stability
 
