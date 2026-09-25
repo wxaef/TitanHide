@@ -114,6 +114,24 @@ can bypass this interception layer.
 
 The x64dbg breakpoints are also user-mode software breakpoints, so sufficiently aggressive anti-debug code can potentially detect them. This branch avoids PatchGuard/DSE bypasses; it is not intended to make user-mode instrumentation impossible to detect.
 
+## VMProtect mode
+
+For VMProtect targets, use:
+
+```
+TitanHideMode vmp
+TitanHide
+```
+
+Stage 1 VMProtect compatibility currently adds:
+
+- `PEB.OSBuildNumber = 1337`, matching the strategy used by ScyllaHide's VMProtect profile;
+- `NtQueryInformationThread(ThreadHideFromDebugger)` filtering;
+- automatic removal of the main module entry-point breakpoint;
+- all normal driverless anti-debug filtering already provided by `user` mode.
+
+This improves compatibility with VMProtect, but it does **not yet** fully defeat direct-syscall or custom-syscall-stub checks. Those require an in-process hook / instrumentation-callback layer rather than only breakpoints on normal `ntdll.dll` exports.
+
 ## Commands
 
 ### Show or change mode
