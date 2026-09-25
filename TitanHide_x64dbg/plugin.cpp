@@ -17,6 +17,16 @@ enum TITANHIDE_MODE
 
 static TITANHIDE_MODE mode = TitanHideModeAuto;
 
+struct PEB_BACKUP
+{
+    bool valid;
+    duint peb;
+    BYTE beingDebugged;
+    DWORD ntGlobalFlag;
+};
+
+static PEB_BACKUP pebBackup = {};
+
 static const char* ModeName(TITANHIDE_MODE value)
 {
     switch(value)
@@ -39,18 +49,33 @@ static bool PatchPebAntiDebug()
         return false;
     }
 
+    BYTE originalBeingDebugged = 0;
+    DWORD originalNtGlobalFlag = 0;
+#ifdef _WIN64
+    const duint ntGlobalFlagOffset = 0xBC;
+#else
+    const duint ntGlobalFlagOffset = 0x68;
+#endif
+
+    if(!DbgMemRead(peb + 2, &originalBeingDebugged, sizeof(originalBeingDebugged)))
+        return false;
+
+    DbgMemRead(peb + ntGlobalFlagOffset, &originalNtGlobalFlag, sizeof(originalNtGlobalFlag));
+
+    if(!pebBackup.valid)
+    {
+        pebBackup.valid = true;
+        pebBackup.peb = peb;
+        pebBackup.beingDebugged = originalBeingDebugged;
+        pebBackup.ntGlobalFlag = originalNtGlobalFlag;
+    }
+
     BYTE beingDebugged = 0;
     if(!DbgMemWrite(peb + 2, &beingDebugged, sizeof(beingDebugged)))
     {
         _plugin_logputs("[" PLUGIN_NAME "] Failed to clear PEB.BeingDebugged");
         return false;
     }
-
-#ifdef _WIN64
-    const duint ntGlobalFlagOffset = 0xBC;
-#else
-    const duint ntGlobalFlagOffset = 0x68;
-#endif
 
     DWORD ntGlobalFlag = 0;
     if(DbgMemRead(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag)))
@@ -71,6 +96,22 @@ static bool ApplyUserModeHide()
     const bool commandOk = DbgCmdExecDirect("hide");
     const bool pebOk = PatchPebAntiDebug();
     return commandOk || pebOk;
+}
+
+static void RestorePebAntiDebug()
+{
+    if(!pebBackup.valid || !pebBackup.peb)
+        return;
+
+#ifdef _WIN64
+    const duint ntGlobalFlagOffset = 0xBC;
+#else
+    const duint ntGlobalFlagOffset = 0x68;
+#endif
+
+    DbgMemWrite(pebBackup.peb + 2, &pebBackup.beingDebugged, sizeof(pebBackup.beingDebugged));
+    DbgMemWrite(pebBackup.peb + ntGlobalFlagOffset, &pebBackup.ntGlobalFlag, sizeof(pebBackup.ntGlobalFlag));
+    pebBackup = {};
 }
 
 static ULONG GetTitanHideOptions()
@@ -152,13 +193,12 @@ static bool cbTitanUnhide(int argc, char* argv[])
 
     _plugin_logprintf("[" PLUGIN_NAME "] Unhiding PID %X (%ud)\n", pid, pid);
 
-    // User-mode PEB changes cannot be reliably reconstructed without keeping
-    // the original values. Stop applying additional hiding for this session.
     if(mode == TitanHideModeDriver)
         TitanHideCall(UnhidePid);
     else if(mode == TitanHideModeAuto)
         TitanHideCall(UnhidePid);
 
+    RestorePebAntiDebug();
     hidden = false;
     return true;
 }
@@ -198,7 +238,7 @@ static bool cbTitanHideOptions(int argc, char* argv[])
     {
         duint options = DbgValFromString(argv[1]);
         BridgeSettingSetUint("TitanHide", "Options", options & 0xffffffff);
-        if (hidden)
+        if(hidden && mode != TitanHideModeUser)
             TitanHideCall(HidePid);
         _plugin_logprintf("[" PLUGIN_NAME "] New options: 0x%08X\n", GetTitanHideOptions());
     }
@@ -223,11 +263,15 @@ static bool cbTitanHideName(int argc, char* argv[])
 PLUG_EXPORT void CBCREATEPROCESS(CBTYPE cbType, PLUG_CB_CREATEPROCESS* info)
 {
     pid = info->fdProcessInfo->dwProcessId;
+    hidden = false;
+    pebBackup = {};
 }
 
 PLUG_EXPORT void CBATTACH(CBTYPE cbType, PLUG_CB_ATTACH* info)
 {
     pid = info->dwProcessId;
+    hidden = false;
+    pebBackup = {};
 }
 
 PLUG_EXPORT void CBSYSTEMBREAKPOINT(CBTYPE cbType, PLUG_CB_SYSTEMBREAKPOINT* info)
