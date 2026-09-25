@@ -23,7 +23,11 @@ enum TITANHIDE_MODE
     TitanHideModeUser
 };
 
+#ifdef _WIN64
+static TITANHIDE_MODE mode = TitanHideModeUser;
+#else
 static TITANHIDE_MODE mode = TitanHideModeAuto;
+#endif
 
 struct PEB_BACKUP
 {
