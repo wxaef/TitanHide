@@ -1,0 +1,103 @@
+name: x64dbg Plugin
+
+on:
+  push:
+    branches:
+      - master
+      - patchguard-compatible
+    paths:
+      - 'TitanHide_x64dbg/**'
+      - 'TitanHide/TitanHide.h'
+      - '.github/workflows/x64dbg-plugin.yml'
+  pull_request:
+    paths:
+      - 'TitanHide_x64dbg/**'
+      - 'TitanHide/TitanHide.h'
+      - '.github/workflows/x64dbg-plugin.yml'
+  workflow_dispatch:
+
+jobs:
+  build-x64-plugin:
+    name: Build x64 Release plugin
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      - name: Build TitanHide x64dbg plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          msbuild.exe TitanHide.sln `
+            /m `
+            /verbosity:minimal `
+            "/t:TitanHide_x64dbg:Rebuild" `
+            /p:Configuration=Release `
+            /p:Platform=x64
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Validate plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $plugin = Join-Path $env:GITHUB_WORKSPACE 'x64\Release\plugins\TitanHide.dp64'
+          if (-not (Test-Path $plugin)) {
+            throw "Expected plugin was not produced: $plugin"
+          }
+
+          $bytes = [IO.File]::ReadAllBytes($plugin)
+          if ($bytes.Length -lt 64) {
+            throw 'Plugin file is truncated'
+          }
+
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+            throw 'Invalid PE header'
+          }
+
+          if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550) {
+            throw 'Invalid PE signature'
+          }
+
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) {
+            throw ('Expected AMD64 PE machine 0x8664, got 0x{0:X4}' -f $machine)
+          }
+
+          Get-Item $plugin | Format-List FullName, Length, LastWriteTime
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $artifact = Join-Path $env:GITHUB_WORKSPACE 'artifact'
+          New-Item -ItemType Directory -Force -Path $artifact | Out-Null
+          Copy-Item 'x64\Release\plugins\TitanHide.dp64' $artifact
+
+          @(
+            'TitanHide x64dbg plugin'
+            ''
+            'Mode: driverless/PatchGuard-compatible user mode by default on x64.'
+            'Copy TitanHide.dp64 into the x64dbg x64 plugins directory.'
+          ) | Set-Content -Path (Join-Path $artifact 'README.txt') -Encoding UTF8
+
+      - name: Upload x64dbg plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: TitanHide-x64dbg-x64-${{ github.sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
