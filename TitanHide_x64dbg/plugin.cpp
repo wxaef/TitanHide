@@ -29,7 +29,8 @@ enum TITANHIDE_MODE
 {
     TitanHideModeAuto,
     TitanHideModeDriver,
-    TitanHideModeUser
+    TitanHideModeUser,
+    TitanHideModeVmp
 };
 
 static TITANHIDE_MODE mode = TitanHideModeUser;
@@ -40,6 +41,7 @@ struct PEB_BACKUP
     duint peb;
     BYTE beingDebugged;
     DWORD ntGlobalFlag;
+    WORD osBuildNumber;
 };
 
 static PEB_BACKUP pebBackup = {};
@@ -52,6 +54,8 @@ static const char* ModeName(TITANHIDE_MODE value)
         return "driver";
     case TitanHideModeUser:
         return "user";
+    case TitanHideModeVmp:
+        return "vmp";
     default:
         return "auto";
     }
@@ -68,16 +72,20 @@ static bool PatchPebAntiDebug()
 
     BYTE originalBeingDebugged = 0;
     DWORD originalNtGlobalFlag = 0;
+    WORD originalOsBuildNumber = 0;
 #ifdef _WIN64
     const duint ntGlobalFlagOffset = 0xBC;
+    const duint osBuildNumberOffset = 0x120;
 #else
     const duint ntGlobalFlagOffset = 0x68;
+    const duint osBuildNumberOffset = 0xAC;
 #endif
 
     if(!TitanMemRead(peb + 2, &originalBeingDebugged, sizeof(originalBeingDebugged)))
         return false;
 
     TitanMemRead(peb + ntGlobalFlagOffset, &originalNtGlobalFlag, sizeof(originalNtGlobalFlag));
+    TitanMemRead(peb + osBuildNumberOffset, &originalOsBuildNumber, sizeof(originalOsBuildNumber));
 
     if(!pebBackup.valid)
     {
@@ -85,6 +93,7 @@ static bool PatchPebAntiDebug()
         pebBackup.peb = peb;
         pebBackup.beingDebugged = originalBeingDebugged;
         pebBackup.ntGlobalFlag = originalNtGlobalFlag;
+        pebBackup.osBuildNumber = originalOsBuildNumber;
     }
 
     BYTE beingDebugged = 0;
@@ -101,6 +110,13 @@ static bool PatchPebAntiDebug()
         // unrelated process flags.
         ntGlobalFlag &= ~(0x10u | 0x20u | 0x40u);
         TitanMemWrite(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag));
+    }
+
+    if(mode == TitanHideModeVmp)
+    {
+        const WORD fakeBuild = 1337;
+        TitanMemWrite(peb + osBuildNumberOffset, &fakeBuild, sizeof(fakeBuild));
+        _plugin_logputs("[" PLUGIN_NAME "] VMP mode: PEB.OSBuildNumber patched to 1337");
     }
 
     _plugin_logprintf("[" PLUGIN_NAME "] User-mode PEB anti-debug flags cleared at %p\n", (void*)peb);
@@ -123,12 +139,15 @@ static void RestorePebAntiDebug()
 
 #ifdef _WIN64
     const duint ntGlobalFlagOffset = 0xBC;
+    const duint osBuildNumberOffset = 0x120;
 #else
     const duint ntGlobalFlagOffset = 0x68;
+    const duint osBuildNumberOffset = 0xAC;
 #endif
 
     TitanMemWrite(pebBackup.peb + 2, &pebBackup.beingDebugged, sizeof(pebBackup.beingDebugged));
     TitanMemWrite(pebBackup.peb + ntGlobalFlagOffset, &pebBackup.ntGlobalFlag, sizeof(pebBackup.ntGlobalFlag));
+    TitanMemWrite(pebBackup.peb + osBuildNumberOffset, &pebBackup.osBuildNumber, sizeof(pebBackup.osBuildNumber));
     pebBackup = {};
 }
 
@@ -157,6 +176,7 @@ static bool InstallUserApiHooks()
     bool ok = true;
     ok &= SetTitanBreakpoint("NtQueryInformationProcess", "TitanHide.NtQueryInformationProcess");
     ok &= SetTitanBreakpoint("NtSetInformationThread", "TitanHide.NtSetInformationThread");
+    ok &= SetTitanBreakpoint("NtQueryInformationThread", "TitanHide.NtQueryInformationThread");
     ok &= SetTitanBreakpoint("NtQuerySystemInformation", "TitanHide.NtQuerySystemInformation");
     ok &= SetTitanBreakpoint("NtSystemDebugControl", "TitanHide.NtSystemDebugControl");
     ok &= SetTitanBreakpoint("NtCreateThreadEx", "TitanHide.NtCreateThreadEx");
@@ -175,6 +195,7 @@ static void RemoveUserApiHooks()
 {
     DeleteTitanBreakpoint("TitanHide.NtQueryInformationProcess");
     DeleteTitanBreakpoint("TitanHide.NtSetInformationThread");
+    DeleteTitanBreakpoint("TitanHide.NtQueryInformationThread");
     DeleteTitanBreakpoint("TitanHide.NtQuerySystemInformation");
     DeleteTitanBreakpoint("TitanHide.NtSystemDebugControl");
     DeleteTitanBreakpoint("TitanHide.NtCreateThreadEx");
@@ -313,6 +334,59 @@ static bool HandleNtQueryInformationProcess()
     }
 
     return false;
+}
+
+
+static bool HandleNtQueryInformationThread()
+{
+    const ULONG options = GetTitanHideOptions();
+    const ULONG infoClass = (ULONG)NtArg(2);
+    const duint output = NtArg(3);
+    const ULONG outputLength = (ULONG)NtArg(4);
+    const duint returnLengthPtr = NtArg(5);
+
+    // ThreadHideFromDebugger == 0x11.
+    if(infoClass == 0x11 &&
+       (options & HideThreadHideFromDebugger) &&
+       output && outputLength >= sizeof(BYTE))
+    {
+        BYTE value = TRUE;
+        TitanMemWrite(output, &value, sizeof(value));
+        if(returnLengthPtr)
+        {
+            ULONG length = sizeof(value);
+            TitanMemWrite(returnLengthPtr, &length, sizeof(length));
+        }
+        return ReturnFromNtCall(0);
+    }
+
+    return false;
+}
+
+static void RemoveMainEntryBreakpoint()
+{
+    const duint mainBase = DbgValFromString("mod.main()");
+    if(!mainBase)
+        return;
+
+    char expression[128] = {};
+#ifdef _WIN64
+    sprintf_s(expression, "mod.entry(%llX)", (unsigned long long)mainBase);
+#else
+    sprintf_s(expression, "mod.entry(%X)", (unsigned int)mainBase);
+#endif
+    const duint entry = DbgValFromString(expression);
+    if(!entry)
+        return;
+
+    char command[128] = {};
+#ifdef _WIN64
+    sprintf_s(command, "bc %llX", (unsigned long long)entry);
+#else
+    sprintf_s(command, "bc %X", (unsigned int)entry);
+#endif
+    if(DbgCmdExecDirect(command))
+        _plugin_logputs("[" PLUGIN_NAME "] VMP mode: removed main entry-point breakpoint");
 }
 
 static bool HandleNtSetInformationThread()
@@ -814,9 +888,11 @@ static bool cbTitanHide(int argc, char* argv[])
         if(result)
             ApplyUserModeHide();
     }
-    else if(mode == TitanHideModeUser)
+    else if(mode == TitanHideModeUser || mode == TitanHideModeVmp)
     {
         result = ApplyUserModeHide();
+        if(mode == TitanHideModeVmp)
+            RemoveMainEntryBreakpoint();
     }
     else
     {
@@ -868,9 +944,11 @@ static bool cbTitanHideMode(int argc, char* argv[])
         mode = TitanHideModeDriver;
     else if(_stricmp(argv[1], "user") == 0 || _stricmp(argv[1], "compat") == 0)
         mode = TitanHideModeUser;
+    else if(_stricmp(argv[1], "vmp") == 0 || _stricmp(argv[1], "vmprotect") == 0)
+        mode = TitanHideModeVmp;
     else
     {
-        _plugin_logputs("[" PLUGIN_NAME "] Usage: TitanHideMode auto|driver|user");
+        _plugin_logputs("[" PLUGIN_NAME "] Usage: TitanHideMode auto|driver|user|vmp");
         return false;
     }
 
@@ -950,6 +1028,8 @@ PLUG_EXPORT void CBBREAKPOINT(CBTYPE cbType, PLUG_CB_BREAKPOINT* info)
         handled = HandleNtQueryInformationProcess();
     else if(strcmp(name, "TitanHide.NtSetInformationThread") == 0)
         handled = HandleNtSetInformationThread();
+    else if(strcmp(name, "TitanHide.NtQueryInformationThread") == 0)
+        handled = HandleNtQueryInformationThread();
     else if(strcmp(name, "TitanHide.NtQuerySystemInformation") == 0)
         handled = HandleNtQuerySystemInformation();
     else if(strcmp(name, "TitanHide.NtSystemDebugControl") == 0)
@@ -992,7 +1072,7 @@ void TitanHideInit(PLUG_INITSTRUCT* initStruct)
     }
 
     duint savedMode = 0;
-    if(BridgeSettingGetUint("TitanHide", "Mode", &savedMode) && savedMode <= TitanHideModeUser)
+    if(BridgeSettingGetUint("TitanHide", "Mode", &savedMode) && savedMode <= TitanHideModeVmp)
         mode = (TITANHIDE_MODE)savedMode;
 
     _plugin_registercommand(pluginHandle, "TitanHide", cbTitanHide, true);
