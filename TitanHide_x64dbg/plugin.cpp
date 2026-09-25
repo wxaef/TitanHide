@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <cwchar>
 #include "../TitanHide/TitanHide.h"
 
 static bool TitanMemRead(duint address, void* buffer, duint size)
