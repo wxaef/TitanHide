@@ -9,6 +9,10 @@ static bool hidden = false;
 static std::string driverName = "TitanHide";
 
 static ULONG GetTitanHideOptions();
+#ifdef _WIN64
+static bool InstallUserApiHooks();
+static void RemoveUserApiHooks();
+#endif
 
 enum TITANHIDE_MODE
 {
@@ -148,6 +152,8 @@ static bool InstallUserApiHooks()
     ok &= SetTitanBreakpoint("NtQueryInformationProcess", "TitanHide.NtQueryInformationProcess");
     ok &= SetTitanBreakpoint("NtSetInformationThread", "TitanHide.NtSetInformationThread");
     ok &= SetTitanBreakpoint("NtQuerySystemInformation", "TitanHide.NtQuerySystemInformation");
+    ok &= SetTitanBreakpoint("NtSystemDebugControl", "TitanHide.NtSystemDebugControl");
+    ok &= SetTitanBreakpoint("NtCreateThreadEx", "TitanHide.NtCreateThreadEx");
 
     userHooksInstalled = ok;
     _plugin_logprintf("[" PLUGIN_NAME "] User-mode Nt* interception %s\n", ok ? "enabled" : "partially failed");
@@ -162,6 +168,8 @@ static void RemoveUserApiHooks()
     DeleteTitanBreakpoint("TitanHide.NtQueryInformationProcess");
     DeleteTitanBreakpoint("TitanHide.NtSetInformationThread");
     DeleteTitanBreakpoint("TitanHide.NtQuerySystemInformation");
+    DeleteTitanBreakpoint("TitanHide.NtSystemDebugControl");
+    DeleteTitanBreakpoint("TitanHide.NtCreateThreadEx");
     userHooksInstalled = false;
 }
 
@@ -259,6 +267,50 @@ static bool HandleNtSetInformationThread()
         return ReturnFromNtCall(0);
 
     return false;
+}
+
+
+static bool HandleNtSystemDebugControl()
+{
+    const ULONG options = GetTitanHideOptions();
+    const ULONG command = (ULONG)DbgValFromString("rcx");
+
+    if(!(options & HideNtSystemDebugControl))
+        return false;
+
+    // Preserve the two dump-related commands used by the original TitanHide
+    // implementation. All other SystemDebugControl requests are reported as
+    // unavailable to user-mode anti-debug checks.
+    const ULONG SysDbgGetTriageDump = 29;
+    const ULONG SysDbgGetLiveKernelDump = 37;
+    if(command == SysDbgGetTriageDump || command == SysDbgGetLiveKernelDump)
+        return false;
+
+    // STATUS_DEBUGGER_INACTIVE
+    return ReturnFromNtCall(0xC0000354u);
+}
+
+static bool HandleNtCreateThreadEx()
+{
+    const ULONG options = GetTitanHideOptions();
+    if(!(options & HideThreadHideFromDebugger))
+        return false;
+
+    // CreateFlags is the 7th parameter:
+    // rcx, rdx, r8, r9, then stack parameters starting at rsp+0x28.
+    duint createFlagsAddress = DbgValFromString("rsp") + 0x38;
+    ULONG createFlags = 0;
+    if(!DbgMemRead(createFlagsAddress, &createFlags, sizeof(createFlags)))
+        return false;
+
+    const ULONG THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER = 0x4;
+    if((createFlags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER) == 0)
+        return false;
+
+    createFlags &= ~THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
+    DbgMemWrite(createFlagsAddress, &createFlags, sizeof(createFlags));
+    _plugin_logputs("[" PLUGIN_NAME "] Cleared NtCreateThreadEx HIDE_FROM_DEBUGGER flag");
+    return false; // let the real NtCreateThreadEx execute with sanitized flags
 }
 
 static bool HandleNtQuerySystemInformation()
@@ -471,6 +523,10 @@ PLUG_EXPORT void CBBREAKPOINT(CBTYPE cbType, PLUG_CB_BREAKPOINT* info)
         handled = HandleNtSetInformationThread();
     else if(strcmp(name, "TitanHide.NtQuerySystemInformation") == 0)
         handled = HandleNtQuerySystemInformation();
+    else if(strcmp(name, "TitanHide.NtSystemDebugControl") == 0)
+        handled = HandleNtSystemDebugControl();
+    else if(strcmp(name, "TitanHide.NtCreateThreadEx") == 0)
+        handled = HandleNtCreateThreadEx();
 
     if(handled)
         DbgCmdExecDirect("run");
