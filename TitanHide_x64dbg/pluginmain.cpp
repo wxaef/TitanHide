@@ -14,6 +14,7 @@ enum TITANHIDE_MENU_ID
     MENU_UNHIDE,
     MENU_MODE_USER,
     MENU_MODE_VMP,
+    MENU_MODE_THEMIDA_DIAG,
     MENU_MODE_AUTO,
     MENU_SHOW_MODE
 };
@@ -47,6 +48,7 @@ PLUG_EXPORT void plugsetup(PLUG_SETUPSTRUCT* setupStruct)
     _plugin_menuaddseparator(hMenu);
     _plugin_menuaddentry(hMenu, MENU_MODE_USER, "Use user mode (driverless)");
     _plugin_menuaddentry(hMenu, MENU_MODE_VMP, "Use VMProtect mode");
+    _plugin_menuaddentry(hMenu, MENU_MODE_THEMIDA_DIAG, "Themida diagnostic mode");
     _plugin_menuaddentry(hMenu, MENU_MODE_AUTO, "Use auto mode");
     _plugin_menuaddentry(hMenu, MENU_SHOW_MODE, "Show current mode");
 }
@@ -69,6 +71,9 @@ PLUG_EXPORT void CBMENUENTRY(CBTYPE cbType, PLUG_CB_MENUENTRY* info)
         break;
     case MENU_MODE_VMP:
         DbgCmdExecDirect("TitanHideMode vmp");
+        break;
+    case MENU_MODE_THEMIDA_DIAG:
+        DbgCmdExecDirect("TitanHideMode themida-diagnostic");
         break;
     case MENU_MODE_AUTO:
         DbgCmdExecDirect("TitanHideMode auto");
