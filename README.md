@@ -132,6 +132,32 @@ Stage 1 VMProtect compatibility currently adds:
 
 This improves compatibility with VMProtect, but it does **not yet** fully defeat direct-syscall or custom-syscall-stub checks. Those require an in-process hook / instrumentation-callback layer rather than only breakpoints on normal `ntdll.dll` exports.
 
+## Themida / WinLicense diagnostic mode
+
+For authorized analysis of Themida/WinLicense targets, use:
+
+```
+TitanHideMode themida-diagnostic
+TitanHide
+```
+
+This mode does **not** falsify API results. It logs the anti-debug calls that pass through the normal `ntdll.dll` exports and automatically continues execution.
+
+Currently logged calls include:
+
+- `NtQueryInformationProcess` and its information class;
+- `NtQueryInformationThread`;
+- `NtSetInformationThread`;
+- `NtQuerySystemInformation`;
+- `NtQueryObject`;
+- `NtClose`;
+- `NtDuplicateObject`;
+- `NtCreateThreadEx`;
+- `NtGetContextThread` / `NtSetContextThread`;
+- `NtSystemDebugControl`.
+
+Use the x32dbg/x64dbg log pane to see which checks occur immediately before the protector reports a debugger. This is intended to identify compatibility problems without adding direct-syscall or injected stealth bypasses.
+
 ## Commands
 
 ### Show or change mode
