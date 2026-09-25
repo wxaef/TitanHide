@@ -30,7 +30,8 @@ enum TITANHIDE_MODE
     TitanHideModeAuto,
     TitanHideModeDriver,
     TitanHideModeUser,
-    TitanHideModeVmp
+    TitanHideModeVmp,
+    TitanHideModeThemidaDiagnostic
 };
 
 static TITANHIDE_MODE mode = TitanHideModeUser;
@@ -56,6 +57,8 @@ static const char* ModeName(TITANHIDE_MODE value)
         return "user";
     case TitanHideModeVmp:
         return "vmp";
+    case TitanHideModeThemidaDiagnostic:
+        return "themida-diagnostic";
     default:
         return "auto";
     }
@@ -277,6 +280,63 @@ static bool ReturnFromNtCall(duint status)
         return false;
 #endif
     return true;
+}
+
+
+static void LogDiagnosticNtCall(const char* name)
+{
+    if(!name)
+        return;
+
+    if(strcmp(name, "TitanHide.NtQueryInformationProcess") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtQueryInformationProcess: class=%u process=%p out=%p len=%u\n",
+            (ULONG)NtArg(2), (void*)NtArg(1), (void*)NtArg(3), (ULONG)NtArg(4));
+    }
+    else if(strcmp(name, "TitanHide.NtQueryInformationThread") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtQueryInformationThread: class=%u thread=%p out=%p len=%u\n",
+            (ULONG)NtArg(2), (void*)NtArg(1), (void*)NtArg(3), (ULONG)NtArg(4));
+    }
+    else if(strcmp(name, "TitanHide.NtSetInformationThread") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtSetInformationThread: class=%u thread=%p len=%u\n",
+            (ULONG)NtArg(2), (void*)NtArg(1), (ULONG)NtArg(4));
+    }
+    else if(strcmp(name, "TitanHide.NtQuerySystemInformation") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtQuerySystemInformation: class=%u out=%p len=%u\n",
+            (ULONG)NtArg(1), (void*)NtArg(2), (ULONG)NtArg(3));
+    }
+    else if(strcmp(name, "TitanHide.NtQueryObject") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtQueryObject: class=%u handle=%p out=%p len=%u\n",
+            (ULONG)NtArg(2), (void*)NtArg(1), (void*)NtArg(3), (ULONG)NtArg(4));
+    }
+    else if(strcmp(name, "TitanHide.NtClose") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtClose: handle=%p\n", (void*)NtArg(1));
+    }
+    else if(strcmp(name, "TitanHide.NtDuplicateObject") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtDuplicateObject: sourceProcess=%p sourceHandle=%p options=0x%X\n",
+            (void*)NtArg(1), (void*)NtArg(2), (ULONG)NtArg(7));
+    }
+    else if(strcmp(name, "TitanHide.NtCreateThreadEx") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtCreateThreadEx: process=%p flags=0x%X\n",
+            (void*)NtArg(4), (ULONG)NtArg(7));
+    }
+    else if(strcmp(name, "TitanHide.NtGetContextThread") == 0 ||
+            strcmp(name, "TitanHide.NtSetContextThread") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] %s: thread=%p context=%p\n",
+            name + strlen("TitanHide."), (void*)NtArg(1), (void*)NtArg(2));
+    }
+    else if(strcmp(name, "TitanHide.NtSystemDebugControl") == 0)
+    {
+        _plugin_logprintf("[" PLUGIN_NAME "][diag] NtSystemDebugControl: command=%u\n", (ULONG)NtArg(1));
+    }
 }
 
 static bool HandleNtQueryInformationProcess()
@@ -894,6 +954,11 @@ static bool cbTitanHide(int argc, char* argv[])
         if(mode == TitanHideModeVmp)
             RemoveMainEntryBreakpoint();
     }
+    else if(mode == TitanHideModeThemidaDiagnostic)
+    {
+        result = InstallUserApiHooks();
+        _plugin_logputs("[" PLUGIN_NAME "] Themida diagnostic mode enabled: logging checks without modifying results");
+    }
     else
     {
         // Auto mode prefers the legacy driver when available, but gracefully
@@ -946,9 +1011,11 @@ static bool cbTitanHideMode(int argc, char* argv[])
         mode = TitanHideModeUser;
     else if(_stricmp(argv[1], "vmp") == 0 || _stricmp(argv[1], "vmprotect") == 0)
         mode = TitanHideModeVmp;
+    else if(_stricmp(argv[1], "themida-diagnostic") == 0 || _stricmp(argv[1], "themida-diag") == 0)
+        mode = TitanHideModeThemidaDiagnostic;
     else
     {
-        _plugin_logputs("[" PLUGIN_NAME "] Usage: TitanHideMode auto|driver|user|vmp");
+        _plugin_logputs("[" PLUGIN_NAME "] Usage: TitanHideMode auto|driver|user|vmp|themida-diagnostic");
         return false;
     }
 
@@ -1022,6 +1089,14 @@ PLUG_EXPORT void CBBREAKPOINT(CBTYPE cbType, PLUG_CB_BREAKPOINT* info)
         return;
 
     const char* name = info->breakpoint->name;
+
+    if(mode == TitanHideModeThemidaDiagnostic)
+    {
+        LogDiagnosticNtCall(name);
+        DbgCmdExecDirect("run");
+        return;
+    }
+
     bool handled = false;
 
     if(strcmp(name, "TitanHide.NtQueryInformationProcess") == 0)
@@ -1072,7 +1147,7 @@ void TitanHideInit(PLUG_INITSTRUCT* initStruct)
     }
 
     duint savedMode = 0;
-    if(BridgeSettingGetUint("TitanHide", "Mode", &savedMode) && savedMode <= TitanHideModeVmp)
+    if(BridgeSettingGetUint("TitanHide", "Mode", &savedMode) && savedMode <= TitanHideModeThemidaDiagnostic)
         mode = (TITANHIDE_MODE)savedMode;
 
     _plugin_registercommand(pluginHandle, "TitanHide", cbTitanHide, true);
