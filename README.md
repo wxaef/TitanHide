@@ -59,6 +59,31 @@ Windows still requires a kernel driver to have a signature trusted by the platfo
 
 An unsigned local development build will **not** load on a stock Windows installation with DSE enabled. Test-signing mode is only a development option and is not required for a properly signed release build.
 
+## x64dbg driverless compatibility mode
+
+The x64dbg plugin can now operate without `TitanHide.sys`.
+
+Use:
+
+```
+TitanHideMode user
+```
+
+Available modes:
+
+- `TitanHideMode auto` - try the driver first, then fall back to user-mode compatibility mode.
+- `TitanHideMode driver` - require the legacy driver path.
+- `TitanHideMode user` - do not open the driver at all.
+
+In user mode the plugin currently:
+
+- invokes x64dbg's built-in `hide` support;
+- clears `PEB.BeingDebugged`;
+- clears the classic debug-heap bits from `PEB.NtGlobalFlag`;
+- restores the original PEB values when `TitanUnhide` is used.
+
+This makes the plugin usable on a stock system without loading the kernel driver. Advanced Nt* interception features from the original kernel implementation are not yet reproduced by this compatibility layer.
+
 # Installation
 
 1. Copy `TitanHide.sys` to `%systemroot%\system32\drivers`.
