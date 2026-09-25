@@ -1,126 +1,230 @@
-**Do not come here and open issues about problems with installation, crashes with bug check 0x109: CRITICAL_STRUCTURE_CORRUPTION or questions on how to disable PatchGuard. I will permanently ban you from the issue tracker. If you don't know how to properly install the tool you don't know enough to use it responsibly and you should use something else like [ScyllaHide](https://github.com/x64dbg/ScyllaHide).
+# TitanHide — PatchGuard-compatible branch
 
-# Overview
+This branch keeps the original TitanHide source for reference, but changes the recommended x64 design so normal use does **not** require disabling PatchGuard or Driver Signature Enforcement.
 
-This branch contains two modes of interest: the original TitanHide implementation and an x64 PatchGuard-compatible driver mode. The compatibility mode keeps the device/control path but does not activate the legacy SSDT, kernel code-patching, or DKOM paths. Legacy hiding logic remains in the source tree for reference and migration to supported user-mode debugger/plugin techniques.
+The recommended path is now the x64dbg plugin in **driverless user mode**.
 
-The idea for this project was thought of together with cypher, shoutout man!
+## What changed
 
-# Features
+Original TitanHide performs kernel SSDT/code patching. On modern x64 Windows that conflicts with PatchGuard.
 
-- ProcessDebugFlags (NtQueryInformationProcess)
-- ProcessDebugPort (NtQueryInformationProcess)
-- ProcessDebugObjectHandle (NtQueryInformationProcess)
-- DebugObject (NtQueryObject)
-- SystemKernelDebuggerInformation (NtQuerySystemInformation)
-- SystemDebugControl (NtSystemDebugControl)
-- NtClose (STATUS_INVALID_HANDLE/STATUS_HANDLE_NOT_CLOSABLE exceptions)
-- ThreadHideFromDebugger (NtSetInformationThread)
-- Protect DRx (HW BPs) (NtGetContextThread/NtSetContextThread)
+This branch adds an x64 compatibility path that:
 
-# Test environments
+- does not patch the SSDT;
+- does not overwrite `ntoskrnl.exe` code;
+- does not use the legacy kernel code-cave hook path;
+- does not use the legacy `ETHREAD.CrossThreadFlags` DKOM path;
+- can run the x64dbg plugin without loading `TitanHide.sys`;
+- moves common anti-debug handling to the debugger/plugin side.
 
-- Windows 10 x64 & x86
-- Windows 8.1 x64 & x86
-- Windows 7 x64 & x86 (SP1)
-- Windows XP x86 (SP3)
-- Windows XP x64 (SP1)
+The original kernel-hook implementation is still present in the repository for reference and legacy experimentation, but the compatibility path does not initialize it on x64.
 
-# Compiling
+## Recommended mode
 
-1. Install Visual Studio 2022.
-2. Install the [WDK10](https://go.microsoft.com/fwlink/?linkid=2128854)/[WDK8](https://go.microsoft.com/fwlink/p/?LinkID=324284)/[WDK7](https://www.microsoft.com/download/confirmation.aspx?id=11800).
-3. Open `TitanHide.sln` and hit compile!
-
-# Requirements
-
-## PatchGuard-compatible x64 mode
-
-This branch enables a PatchGuard-compatible mode by default on x64.
-
-In this mode TitanHide does **not**:
-
-- patch the SSDT;
-- overwrite `ntoskrnl.exe` code;
-- use the legacy kernel code-cave hook path;
-- modify `ETHREAD.CrossThreadFlags` through the legacy DKOM path.
-
-You therefore do **not** need to disable PatchGuard to load and run the compatibility-mode driver.
-
-> Important: the legacy kernel-hook implementation is still present in the source tree for reference, but it is not activated by the x64 driver entry path in this branch.
-
-Because the legacy global Nt* interception is disabled, kernel-backed hiding features that depended on those hooks are not provided by the compatibility-mode driver. Those features should be implemented in the debugger/user-mode plugin layer instead of by patching protected kernel structures.
-
-## Driver signing / DSE
-
-Do not disable Driver Signature Enforcement for normal use.
-
-Windows still requires a kernel driver to have a signature trusted by the platform. For a normal end-user build, sign and submit the driver through the supported Microsoft driver-signing process and install the resulting signed `TitanHide.sys`.
-
-An unsigned local development build will **not** load on a stock Windows installation with DSE enabled. Test-signing mode is only a development option and is not required for a properly signed release build.
-
-## x64dbg driverless compatibility mode
-
-The x64dbg plugin can now operate without `TitanHide.sys`.
-
-Use:
+In x64dbg:
 
 ```
 TitanHideMode user
 ```
 
-Available modes:
+On x64 this branch defaults to `user` mode.
 
-- `TitanHideMode auto` - try the driver first, then fall back to user-mode compatibility mode.
-- `TitanHideMode driver` - require the legacy driver path.
-- `TitanHideMode user` - do not open the driver at all.
+### Available modes
 
-In user mode the plugin currently:
-
-- invokes x64dbg's built-in `hide` support;
-- clears `PEB.BeingDebugged`;
-- clears the classic debug-heap bits from `PEB.NtGlobalFlag`;
-- restores the original PEB values when `TitanUnhide` is used.
-
-This makes the plugin usable on a stock system without loading the kernel driver.
-
-Current x64 user-mode interception coverage:
-
-| Original TitanHide option | User-mode compatibility status |
+| Mode | Behavior |
 | --- | --- |
-| ProcessDebugPort | Implemented |
-| ProcessDebugObjectHandle | Implemented |
-| ProcessDebugFlags | Implemented |
-| SystemKernelDebuggerInformation | Implemented |
-| SystemKernelDebuggerInformationEx | Implemented |
-| ThreadHideFromDebugger via NtSetInformationThread | Implemented |
-| THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER via NtCreateThreadEx | Implemented |
-| NtSystemDebugControl | Implemented for the same non-dump commands as legacy TitanHide |
-| NtQueryObject / DebugObject counts | Not yet migrated |
-| NtClose exception behavior | Not yet migrated |
-| NtGetContextThread / NtSetContextThread DRx protection | Not yet migrated |
+| `TitanHideMode user` | Recommended. No kernel driver is opened. Uses x64dbg/user-mode compatibility logic. |
+| `TitanHideMode auto` | Tries the driver first, then falls back to user mode. |
+| `TitanHideMode driver` | Legacy/testing path. On this compatibility branch the x64 driver does not initialize the original SSDT hooks. |
 
-The implemented Nt* compatibility hooks use x64dbg-managed breakpoints at ntdll API entry points and short-circuit only the anti-debug query classes listed above. They do not patch SSDT entries or protected kernel code.
+## PatchGuard / DSE
 
-# Installation
+### Driverless user mode
 
-1. Copy `TitanHide.sys` to `%systemroot%\system32\drivers`.
-2. Run the command `sc create TitanHide binPath= %systemroot%\system32\drivers\TitanHide.sys type= kernel` to create the TitanHide service.
-3. Run the command `sc start TitanHide` to start the TitanHide service.
-4. Run the command `sc query TitanHide` to check if TitanHide is running.
-
-To check if TitanHide is working correctly, use [DebugView](https://technet.microsoft.com/en-us/sysinternals/debugview.aspx) or check `C:\TitanHide.log`.
-
-## Hiding
-
-For VMProtect 3.9.4 and above you need to change the service name to something else. For example `sc create NotTitanHide`, which will bypass their latest 'detection'. After changing the service name you will need to configure the plugin with the following command in x64dbg:
+For:
 
 ```
-TitanHideName NotTitanHide
+TitanHideMode user
 ```
 
-# Remarks
+you do **not** need to:
 
-- When using x64dbg, you can use the TitanHide plugin (available on the download page).
-- **NEVER RUN THIS DRIVER ON A PRODUCTION SYSTEM, ALWAYS USE A VM!**
+```
+bcdedit /set testsigning on
+```
 
+and you do **not** need EfiGuard, SandboxBootkit, Shark, UPGDSED, or another PatchGuard bypass.
+
+You can leave:
+
+- PatchGuard enabled;
+- Driver Signature Enforcement enabled;
+- Test Signing disabled.
+
+### Optional kernel driver
+
+If you want to load `TitanHide.sys` on a normal Windows installation with DSE enabled, the driver must use a signature trusted by Windows.
+
+An unsigned development `.sys` will not load on stock Windows with DSE enabled. Test-signing is a development option, not a requirement for a properly signed release driver.
+
+## x64 user-mode compatibility features
+
+The x64dbg plugin currently provides:
+
+| Feature | Status |
+| --- | --- |
+| x64dbg built-in debugger hiding | Implemented |
+| `PEB.BeingDebugged` | Implemented |
+| Debug heap bits in `PEB.NtGlobalFlag` | Implemented |
+| `ProcessDebugPort` | Implemented |
+| `ProcessDebugObjectHandle` | Implemented |
+| `ProcessDebugFlags` | Implemented |
+| `SystemKernelDebuggerInformation` | Implemented |
+| `SystemKernelDebuggerInformationEx` | Implemented |
+| `ThreadHideFromDebugger` / `NtSetInformationThread` | Implemented |
+| `NtCreateThreadEx` `HIDE_FROM_DEBUGGER` | Implemented |
+| `NtSystemDebugControl` anti-debug queries | Implemented |
+| `NtQueryObject` / DebugObject filtering | Implemented |
+| `NtClose` invalid/protected-handle behavior | Implemented |
+| `NtDuplicateObject` protected close-source handling | Implemented |
+| `NtGetContextThread` DRx hiding | Implemented |
+| `NtSetContextThread` DRx protection | Implemented |
+
+## How user mode works
+
+The compatibility layer uses x64dbg-managed breakpoints on selected `ntdll.dll` exports.
+
+For anti-debug queries that can be answered safely at entry, the plugin writes the expected output and returns directly to the caller.
+
+For context/handle operations, the plugin uses the debugger process to duplicate the target handle and perform the equivalent operation without modifying PatchGuard-protected kernel state.
+
+For `NtQueryObject`, the plugin performs a real local `NtQueryObject`, filters DebugObject information, relocates returned string pointers to the target buffer, and returns the filtered result.
+
+### Important limitation
+
+These hooks intercept calls that pass through the normal `ntdll.dll` exports.
+
+Code using:
+
+- manually issued syscalls;
+- a separately mapped clean copy of `ntdll.dll`;
+- custom syscall stubs;
+
+can bypass this interception layer.
+
+The x64dbg breakpoints are also user-mode software breakpoints, so sufficiently aggressive anti-debug code can potentially detect them. This branch avoids PatchGuard/DSE bypasses; it is not intended to make user-mode instrumentation impossible to detect.
+
+## Commands
+
+### Show or change mode
+
+```
+TitanHideMode
+TitanHideMode user
+TitanHideMode auto
+TitanHideMode driver
+```
+
+### Hide current debuggee
+
+```
+TitanHide
+```
+
+### Restore plugin-managed state
+
+```
+TitanUnhide
+```
+
+`TitanUnhide` removes TitanHide's user-mode API breakpoints and restores the backed-up PEB values.
+
+### Options
+
+Show current bit mask:
+
+```
+TitanHideOptions
+```
+
+Set it:
+
+```
+TitanHideOptions 0xFFFFFFFF
+```
+
+The bit definitions remain in:
+
+```
+TitanHide/TitanHide.h
+```
+
+### Legacy driver name
+
+```
+TitanHideName TitanHide
+```
+
+This only matters when using a driver-based mode.
+
+## Building
+
+### Requirements
+
+- Visual Studio 2022
+- Windows SDK
+- WDK 10 for the kernel-driver project
+
+Open:
+
+```
+TitanHide.sln
+```
+
+and build the desired x64 configuration.
+
+For driverless use, the important output is the x64dbg plugin. A kernel driver is not required at runtime.
+
+## Driverless installation
+
+1. Build the x64 TitanHide x64dbg plugin.
+2. Copy the plugin to the appropriate x64dbg plugin directory.
+3. Start x64dbg.
+4. Start or attach to the target.
+5. The x64 build defaults to user mode, or explicitly run:
+
+```
+TitanHideMode user
+TitanHide
+```
+
+No `sc create`, `sc start`, test-signing, or PatchGuard-disabling step is required for this mode.
+
+## Optional signed-driver installation
+
+If you have a properly signed `TitanHide.sys`:
+
+```
+copy TitanHide.sys %systemroot%\system32\drivers\
+sc create TitanHide binPath= %systemroot%\system32\drivers\TitanHide.sys type= kernel
+sc start TitanHide
+sc query TitanHide
+```
+
+The compatibility x64 driver intentionally does not activate the legacy SSDT/kernel-code hooks.
+
+## Current scope
+
+This branch primarily targets modern **Windows x64 + x64dbg**.
+
+The repository still contains the historical x86/older-Windows implementation, but the new driverless Nt* compatibility layer is currently x64-specific.
+
+## Safety / stability
+
+Kernel debugging and anti-anti-debug work can destabilize a system. Use a VM or disposable test machine while developing or testing kernel components.
+
+The driverless `user` mode is preferred when the kernel driver is not specifically required.
+
+## Credits
+
+TitanHide is based on the original TitanHide project and retains its existing license and attribution. The user-mode compatibility approach also follows well-established anti-anti-debug techniques used by projects such as ScyllaHide.
