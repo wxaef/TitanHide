@@ -82,7 +82,25 @@ In user mode the plugin currently:
 - clears the classic debug-heap bits from `PEB.NtGlobalFlag`;
 - restores the original PEB values when `TitanUnhide` is used.
 
-This makes the plugin usable on a stock system without loading the kernel driver. Advanced Nt* interception features from the original kernel implementation are not yet reproduced by this compatibility layer.
+This makes the plugin usable on a stock system without loading the kernel driver.
+
+Current x64 user-mode interception coverage:
+
+| Original TitanHide option | User-mode compatibility status |
+| --- | --- |
+| ProcessDebugPort | Implemented |
+| ProcessDebugObjectHandle | Implemented |
+| ProcessDebugFlags | Implemented |
+| SystemKernelDebuggerInformation | Implemented |
+| SystemKernelDebuggerInformationEx | Implemented |
+| ThreadHideFromDebugger via NtSetInformationThread | Implemented |
+| THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER via NtCreateThreadEx | Implemented |
+| NtSystemDebugControl | Implemented for the same non-dump commands as legacy TitanHide |
+| NtQueryObject / DebugObject counts | Not yet migrated |
+| NtClose exception behavior | Not yet migrated |
+| NtGetContextThread / NtSetContextThread DRx protection | Not yet migrated |
+
+The implemented Nt* compatibility hooks use x64dbg-managed breakpoints at ntdll API entry points and short-circuit only the anti-debug query classes listed above. They do not patch SSDT entries or protected kernel code.
 
 # Installation
 
