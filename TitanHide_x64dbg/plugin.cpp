@@ -5,6 +5,16 @@
 #include <vector>
 #include "../TitanHide/TitanHide.h"
 
+static bool TitanMemRead(duint address, void* buffer, duint size)
+{
+    return DbgMemRead(address, reinterpret_cast<unsigned char*>(buffer), size);
+}
+
+static bool TitanMemWrite(duint address, const void* buffer, duint size)
+{
+    return DbgMemWrite(address, reinterpret_cast<const unsigned char*>(buffer), size);
+}
+
 static DWORD pid = 0;
 static bool hidden = false;
 static std::string driverName = "TitanHide";
@@ -69,10 +79,10 @@ static bool PatchPebAntiDebug()
     const duint ntGlobalFlagOffset = 0x68;
 #endif
 
-    if(!DbgMemRead(peb + 2, &originalBeingDebugged, sizeof(originalBeingDebugged)))
+    if(!TitanMemRead(peb + 2, &originalBeingDebugged, sizeof(originalBeingDebugged)))
         return false;
 
-    DbgMemRead(peb + ntGlobalFlagOffset, &originalNtGlobalFlag, sizeof(originalNtGlobalFlag));
+    TitanMemRead(peb + ntGlobalFlagOffset, &originalNtGlobalFlag, sizeof(originalNtGlobalFlag));
 
     if(!pebBackup.valid)
     {
@@ -83,19 +93,19 @@ static bool PatchPebAntiDebug()
     }
 
     BYTE beingDebugged = 0;
-    if(!DbgMemWrite(peb + 2, &beingDebugged, sizeof(beingDebugged)))
+    if(!TitanMemWrite(peb + 2, &beingDebugged, sizeof(beingDebugged)))
     {
         _plugin_logputs("[" PLUGIN_NAME "] Failed to clear PEB.BeingDebugged");
         return false;
     }
 
     DWORD ntGlobalFlag = 0;
-    if(DbgMemRead(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag)))
+    if(TitanMemRead(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag)))
     {
         // Clear the three classic debug-heap creation flags while preserving
         // unrelated process flags.
         ntGlobalFlag &= ~(0x10u | 0x20u | 0x40u);
-        DbgMemWrite(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag));
+        TitanMemWrite(peb + ntGlobalFlagOffset, &ntGlobalFlag, sizeof(ntGlobalFlag));
     }
 
     _plugin_logprintf("[" PLUGIN_NAME "] User-mode PEB anti-debug flags cleared at %p\n", (void*)peb);
@@ -126,8 +136,8 @@ static void RestorePebAntiDebug()
     const duint ntGlobalFlagOffset = 0x68;
 #endif
 
-    DbgMemWrite(pebBackup.peb + 2, &pebBackup.beingDebugged, sizeof(pebBackup.beingDebugged));
-    DbgMemWrite(pebBackup.peb + ntGlobalFlagOffset, &pebBackup.ntGlobalFlag, sizeof(pebBackup.ntGlobalFlag));
+    TitanMemWrite(pebBackup.peb + 2, &pebBackup.beingDebugged, sizeof(pebBackup.beingDebugged));
+    TitanMemWrite(pebBackup.peb + ntGlobalFlagOffset, &pebBackup.ntGlobalFlag, sizeof(pebBackup.ntGlobalFlag));
     pebBackup = {};
 }
 
@@ -189,14 +199,14 @@ static void RemoveUserApiHooks()
 static bool ReadStackPointer(duint offset, duint* value)
 {
     const duint rsp = DbgValFromString("rsp");
-    return rsp != 0 && DbgMemRead(rsp + offset, value, sizeof(*value));
+    return rsp != 0 && TitanMemRead(rsp + offset, value, sizeof(*value));
 }
 
 static bool ReturnFromNtCall(duint status)
 {
     const duint rsp = DbgValFromString("rsp");
     duint returnAddress = 0;
-    if(!rsp || !DbgMemRead(rsp, &returnAddress, sizeof(returnAddress)) || !returnAddress)
+    if(!rsp || !TitanMemRead(rsp, &returnAddress, sizeof(returnAddress)) || !returnAddress)
         return false;
 
     if(!DbgValToString("rax", status))
@@ -225,11 +235,11 @@ static bool HandleNtQueryInformationProcess()
         if(output && outputLength >= sizeof(duint))
         {
             duint value = 0;
-            DbgMemWrite(output, &value, sizeof(value));
+            TitanMemWrite(output, &value, sizeof(value));
             if(returnLengthPtr)
             {
                 ULONG length = (ULONG)sizeof(duint);
-                DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+                TitanMemWrite(returnLengthPtr, &length, sizeof(length));
             }
             return ReturnFromNtCall(0);
         }
@@ -239,11 +249,11 @@ static bool HandleNtQueryInformationProcess()
         if(output && outputLength >= sizeof(duint))
         {
             duint value = 0;
-            DbgMemWrite(output, &value, sizeof(value));
+            TitanMemWrite(output, &value, sizeof(value));
             if(returnLengthPtr)
             {
                 ULONG length = (ULONG)sizeof(duint);
-                DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+                TitanMemWrite(returnLengthPtr, &length, sizeof(length));
             }
 
             // STATUS_PORT_NOT_SET
@@ -255,11 +265,11 @@ static bool HandleNtQueryInformationProcess()
         if(output && outputLength >= sizeof(ULONG))
         {
             ULONG value = TRUE;
-            DbgMemWrite(output, &value, sizeof(value));
+            TitanMemWrite(output, &value, sizeof(value));
             if(returnLengthPtr)
             {
                 ULONG length = sizeof(ULONG);
-                DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+                TitanMemWrite(returnLengthPtr, &length, sizeof(length));
             }
             return ReturnFromNtCall(0);
         }
@@ -426,7 +436,7 @@ static bool HandleNtQueryObject()
         CloseHandle(localHandle);
 
     if(returnLengthPtr)
-        DbgMemWrite(returnLengthPtr, &returnLength, sizeof(returnLength));
+        TitanMemWrite(returnLengthPtr, &returnLength, sizeof(returnLength));
 
     if(status >= 0)
     {
@@ -479,7 +489,7 @@ static bool HandleNtQueryObject()
                 size_t copyLength = returnLength ? (size_t)returnLength : buffer.size();
         if(copyLength > buffer.size())
             copyLength = buffer.size();
-        DbgMemWrite(output, buffer.data(), (duint)copyLength);
+        TitanMemWrite(output, buffer.data(), (duint)copyLength);
     }
 
     return ReturnFromNtCall((duint)(ULONG)status);
@@ -549,7 +559,7 @@ static bool HandleNtDuplicateObject()
     {
         ULONG sanitized = (ULONG)optionsValue & ~DUPLICATE_CLOSE_SOURCE_FLAG;
         const duint rsp = DbgValFromString("rsp");
-        DbgMemWrite(rsp + 0x38, &sanitized, sizeof(sanitized));
+        TitanMemWrite(rsp + 0x38, &sanitized, sizeof(sanitized));
         _plugin_logputs("[" PLUGIN_NAME "] Cleared NtDuplicateObject DUPLICATE_CLOSE_SOURCE on protected handle");
     }
 
@@ -568,7 +578,7 @@ static bool HandleNtGetContextThread()
         return false;
 
     CONTEXT context = {};
-    if(!DbgMemRead(contextAddress, &context, sizeof(context)))
+    if(!TitanMemRead(contextAddress, &context, sizeof(context)))
         return false;
 
     const DWORD originalFlags = context.ContextFlags;
@@ -602,7 +612,7 @@ static bool HandleNtGetContextThread()
 #endif
     }
 
-    if(!DbgMemWrite(contextAddress, &context, sizeof(context)))
+    if(!TitanMemWrite(contextAddress, &context, sizeof(context)))
         return false;
 
     return ReturnFromNtCall(0);
@@ -620,7 +630,7 @@ static bool HandleNtSetContextThread()
         return false;
 
     CONTEXT context = {};
-    if(!DbgMemRead(contextAddress, &context, sizeof(context)))
+    if(!TitanMemRead(contextAddress, &context, sizeof(context)))
         return false;
 
     const DWORD originalFlags = context.ContextFlags;
@@ -636,7 +646,7 @@ static bool HandleNtSetContextThread()
 
     // Preserve the caller's input buffer exactly as the legacy hook did.
     context.ContextFlags = originalFlags;
-    DbgMemWrite(contextAddress, &context, sizeof(context));
+    TitanMemWrite(contextAddress, &context, sizeof(context));
 
     if(!ok)
         return false;
@@ -674,7 +684,7 @@ static bool HandleNtCreateThreadEx()
     // rcx, rdx, r8, r9, then stack parameters starting at rsp+0x28.
     duint createFlagsAddress = DbgValFromString("rsp") + 0x38;
     ULONG createFlags = 0;
-    if(!DbgMemRead(createFlagsAddress, &createFlags, sizeof(createFlags)))
+    if(!TitanMemRead(createFlagsAddress, &createFlags, sizeof(createFlags)))
         return false;
 
     const ULONG THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER = 0x4;
@@ -682,7 +692,7 @@ static bool HandleNtCreateThreadEx()
         return false;
 
     createFlags &= ~THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
-    DbgMemWrite(createFlagsAddress, &createFlags, sizeof(createFlags));
+    TitanMemWrite(createFlagsAddress, &createFlags, sizeof(createFlags));
     _plugin_logputs("[" PLUGIN_NAME "] Cleared NtCreateThreadEx HIDE_FROM_DEBUGGER flag");
     return false; // let the real NtCreateThreadEx execute with sanitized flags
 }
@@ -702,11 +712,11 @@ static bool HandleNtQuerySystemInformation()
     if(infoClass == 35 && outputLength >= 2)
     {
         BYTE info[2] = { FALSE, TRUE };
-        DbgMemWrite(output, info, sizeof(info));
+        TitanMemWrite(output, info, sizeof(info));
         if(returnLengthPtr)
         {
             ULONG length = sizeof(info);
-            DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+            TitanMemWrite(returnLengthPtr, &length, sizeof(length));
         }
         return ReturnFromNtCall(0);
     }
@@ -715,11 +725,11 @@ static bool HandleNtQuerySystemInformation()
     if(infoClass == 149 && outputLength >= 3)
     {
         BYTE info[3] = { FALSE, FALSE, FALSE };
-        DbgMemWrite(output, info, sizeof(info));
+        TitanMemWrite(output, info, sizeof(info));
         if(returnLengthPtr)
         {
             ULONG length = sizeof(info);
-            DbgMemWrite(returnLengthPtr, &length, sizeof(length));
+            TitanMemWrite(returnLengthPtr, &length, sizeof(length));
         }
         return ReturnFromNtCall(0);
     }
